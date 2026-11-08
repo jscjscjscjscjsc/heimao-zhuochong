@@ -144,8 +144,27 @@ class AppRuntime:
                 from core.fast_commands import match
                 text=str(args.get('name',''))
                 if not match(text).get('matched'):raise ValueError('仅支持已识别的本地快速命令；本操作不会转交大模型')
+                # panel.send 只是把句子排进队列，_last_fast_result 立刻就是"正在提交…"；
+                # 真正的成败写在 runtime/voice/fast_command_diagnostics.json 里，等它更新。
+                import json as _j, time as _t
+                from pathlib import Path as _P
+                diag=_P(__file__).resolve().parent.parent/'runtime'/'voice'/'fast_command_diagnostics.json'
+                try: before=diag.stat().st_mtime
+                except OSError: before=0.0
                 self.panel.send(text)
-                return dict(self.panel._last_fast_result or {},route='local_fast_command')
+                data=None;end=_t.monotonic()+8
+                while _t.monotonic()<end:
+                    _t.sleep(0.3)
+                    try:
+                        if diag.stat().st_mtime!=before:
+                            data=_j.loads(diag.read_text(encoding='utf-8'));break
+                    except (OSError,ValueError):
+                        pass
+                if data is None:
+                    data=dict(self.panel._last_fast_result or {})
+                    data.setdefault('ok',False)
+                    data.setdefault('message','已提交，但 8 秒内没有收到执行结果')
+                return dict(data,route='local_fast_command')
             if args.get('action') == 'list':
                 entries=self.apps.available(args.get('query',''))
                 from core.window_inventory import list_windows
@@ -154,7 +173,28 @@ class AppRuntime:
                     'access':self.apps.access.status(),
                     'note':'running_windows是已打开软件，authorized_apps是可启动软件；先复用已打开窗口。'}
             if args.get('action') == 'open':
-                return self.apps.open(args['name'])
+                name=str(args.get('name',''))
+                result=self.apps.open(name)
+                # 启动请求发出后必须回头核验，否则会把"请求已发出"当成"已经开好"，
+                # 调用方（DSH / 模型）拿着 ok=true 继续往下走，最后层层降级到命令行。
+                if not result.get('verified_running') and not result.get('selection_required'):
+                    import time as _t
+                    from core.window_inventory import list_windows
+                    from core.fast_commands import BROWSER_NAMES
+                    keys=('edge','chrome','firefox','浏览器','360','uc','夸克') if name in BROWSER_NAMES else (name.casefold(),)
+                    hit=[];end=_t.monotonic()+8
+                    while _t.monotonic()<end and not hit:
+                        _t.sleep(0.8)
+                        wins=list_windows('') or []
+                        hit=[w for w in wins if any(k in str(w.get('title') or '').casefold() for k in keys)]
+                    if hit:
+                        result.update(verified_running=True,windows=hit[:5],
+                            message='已确认窗口出现：'+str(hit[0].get('title') or '')[:40])
+                    else:
+                        result.update(verified_running=False,ok=False,
+                            message='已请求启动「'+name[:40]+'」，但 8 秒内没有出现匹配窗口，判定为没开成功；'
+                                    '请换一个更准确的软件名，或先用 computer(action=windows) 看清已开的窗口再决定。')
+                return result
             raise ValueError('未知软件操作')
         if name == 'confirm_external':
             if self.apps.access.enabled:
@@ -255,6 +295,30 @@ class AppRuntime:
                         task=self.panel.agent.task_status(),
                         capabilities=['pet_control', 'workspace', 'applications', 'self_ask', 'ecosystem','battleground','dsh_task','local_computer','computer','screen_share','task_plan','media_workflow','workflow_catalog','wechat_send_self','wechat','browser','web_search','music_performance'],
                         scope='本机能力由完整访问开关控制；继承咕嘎进程实际Windows权限')
+        if name == 'computer':
+            import threading
+            agent = getattr(self.panel, 'agent', None)
+            computer = getattr(agent, 'computer', None)
+            if computer is None:
+                raise RuntimeError('桌面控制不可用：桌面智能体尚未初始化')
+            return computer.execute(args, threading.Event())
+        if name == 'wechat':
+            import threading
+            agent = getattr(self.panel, 'agent', None)
+            wechat = getattr(agent, 'wechat', None)
+            if wechat is None:
+                raise RuntimeError('微信控制不可用：桌面智能体尚未初始化')
+            return wechat.execute(args, threading.Event())
+        if name == 'pet_say':
+            text = str(args.get('text', '')).strip()
+            if not text:
+                raise ValueError('text 不能为空')
+            text = text[:1200]
+            bubble = getattr(self.pet, '_agent_bubble', None)
+            if bubble is None:
+                raise RuntimeError('气泡组件不可用')
+            bubble.show_text(text)
+            return dict(shown=True, chars=len(text))
         if name == 'pet_control':
             return self._pet(args)
         if name == 'workspace':

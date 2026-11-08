@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def selected_text(hwnd):
-    result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-File',
+    result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',
         str(ROOT/'tools/windows_selection.ps1'),str(int(hwnd))],capture_output=True,timeout=4,
         creationflags=0x08000000)
     if result.returncode:raise RuntimeError('未能读取选中文字，请改用框选识字')
@@ -21,7 +21,7 @@ def selected_text(hwnd):
 def recognize(png_bytes):
     with tempfile.TemporaryDirectory(prefix='guga-screen-') as folder:
         image=Path(folder)/'region.png';image.write_bytes(png_bytes)
-        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-File',
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',
             str(ROOT/'tools/windows_ocr.ps1'),str(image)],capture_output=True,timeout=12,
             creationflags=0x08000000)
         if result.returncode:raise RuntimeError('本机识字未完成，请确认 Windows 已安装对应语言的文字识别组件')
