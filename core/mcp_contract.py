@@ -16,13 +16,16 @@ def self_tools():
     from core.self_agent import TOOLS
     result=[dict(name=t['function']['name'], description=t['function']['description'],
                  inputSchema=t['function']['parameters'])
-            for t in TOOLS if t['function']['name'] in ('app_state', 'pet_control', 'workspace', 'applications')]
+            for t in TOOLS if t['function']['name'] in ('app_state', 'pet_control', 'workspace', 'applications', 'computer', 'wechat')]
     result.append(dict(name='voice_session',description='控制咕嘎自己的实时语音会话；start受当前免费额度保护约束，status查看真实状态，stop结束通话；不自动重试。',
         inputSchema=dict(type='object',properties=dict(action=dict(type='string',enum=['start','status','stop'])),
                          required=['action'],additionalProperties=False)))
     result.append(dict(name='screen_share',description='长语音通话默认启用的辅助屏幕上下文。start仅用于当前长通话，2—5帧/秒本地采集，status/context/snapshot/stop控制；不显示预览、不保存录制。',
         inputSchema=dict(type='object',properties=dict(action=dict(type='string',enum=['start','status','stop','context','assist','snapshot']),
             fps=dict(type='integer'),max_age=dict(type='integer')),required=['action'],additionalProperties=False)))
+    result.append(dict(name='pet_say',description='让桌宠在气泡里直接显示一段文字，不调用模型、不写入对话历史、不发声。用于外部系统（如 DSH 插件）把一句话推上桌面。',
+        inputSchema=dict(type='object',properties=dict(text=dict(type='string',description='要显示的文字，最多1200字')),
+                         required=['text'],additionalProperties=False)))
     return result
 
 

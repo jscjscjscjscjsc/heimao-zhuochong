@@ -55,7 +55,9 @@ def _open_app(target):
         if browser:
             # A real browser window, independent of third-party HTTP handlers
             # that may accept a URL without showing it to the user.
-            subprocess.Popen([str(browser),'about:blank'])
+            # 打开"新建标签页"而不是 about:blank：后者是一张白纸，用户还得点后退才能回到起始页；
+            # 不带任何参数启动时 Edge 会走"已有实例"分支直接退出，所以必须给一个能落地的 URL。
+            subprocess.Popen([str(browser), 'about:newtab'])
             return dict(kind='app',target='浏览器',launch_requested=True,verified_running=False,
                 message='已请求浏览器打开新窗口')
         return _open_url('https://www.baidu.com')

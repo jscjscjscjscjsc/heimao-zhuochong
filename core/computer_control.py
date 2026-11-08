@@ -122,8 +122,11 @@ class ComputerControl:
             rect=win32gui.GetWindowRect(hwnd)
             if rect[2]<=rect[0] or rect[3]<=rect[1]:raise ValueError('窗口没有可见区域')
             frame=ImageGrab.grab(bbox=rect,all_screens=True).convert('RGB')
-            frame.thumbnail((1600,1200))
-            output=io.BytesIO();frame.save(output,format='JPEG',quality=78)
+            # 默认压到 1024 长边：满屏截图每张要多花四成 token，而多数点击只需要认出按钮在哪；
+            # 要看清小字再显式传 max_side=1600。坐标仍按 image_size 的相对像素换算。
+            side=max(640,min(1600,int(args.get('max_side') or 1024)))
+            frame.thumbnail((side,int(side*0.75)))
+            output=io.BytesIO();frame.save(output,format='JPEG',quality=72)
             token=uuid.uuid4().hex
             self.observation=dict(id=token,hwnd=hwnd,rect=rect,image_size=frame.size,time=time.monotonic())
             return dict(observation_id=token,hwnd=hwnd,title=win32gui.GetWindowText(hwnd),
@@ -325,8 +328,22 @@ $r=$c.BoundingRectangle
         elif action=='type':
             text=str(args.get('text',''))
             if len(text)>4000:raise ValueError('单次输入最多4000字')
-            if '\n' in text and self._paste_multiline(text,observed['hwnd'],cancel):
-                return dict(input_sent=True,action=action,needs_observe=True,message='多行文本已粘贴；请观察缩进并验证，剪贴板已恢复')
+            # replace=True：先全选，随后的输入会整体替换旧内容（搜索框里残留的脏字就是这么清掉的）。
+            if args.get('replace'):
+                _send_keys([17,65])
+                cancel.wait(.15)
+            # clear=True：再按 Delete 把框清空。微信搜索面板只在"内容发生变化"时弹出，
+            # 如果框里已经是同样的字，直接重输不会触发搜索。
+            if args.get('clear'):
+                _send_keys([46])
+                cancel.wait(.25)
+            # 非 ASCII（日文假名/韩文/emoji/生僻字）不能走 SendInput：
+            # 微信这类自绘输入框会把每个字符都替换成第一个（「おりがみ」被打成「おおおお」）。
+            # 统一改用剪贴板粘贴，兼容性最好，且原剪贴板会恢复。
+            if '\n' in text or any(ord(c)>0x7F for c in text):
+                if self._paste_multiline(text,observed['hwnd'],cancel):
+                    return dict(input_sent=True,action=action,needs_observe=True,
+                        message='含非 ASCII 字符，已改用剪贴板粘贴；剪贴板已恢复，请 observe 核对')
             # KEYEVENTF_UNICODE; preserves the user's clipboard.
             class KI(ctypes.Structure):
                 _fields_=[('vk',wintypes.WORD),('scan',wintypes.WORD),('flags',wintypes.DWORD),('time',wintypes.DWORD),('extra',ctypes.c_size_t)]

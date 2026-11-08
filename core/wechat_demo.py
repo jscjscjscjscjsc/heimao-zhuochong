@@ -32,7 +32,7 @@ def read_frame(observation):
         path=Path(handle.name);handle.write(base64.b64decode(observation['_image_url'].split(',',1)[1]))
     try:
         try:
-            result=subprocess.run(['powershell.exe','-NoProfile','-File',str(ROOT/'tools/windows_ocr.ps1'),str(path)],
+            result=subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-File',str(ROOT/'tools/windows_ocr.ps1'),str(path)],
                 capture_output=True,timeout=12,creationflags=0x08000000)
         except subprocess.TimeoutExpired:raise RuntimeError('读取微信界面超时；未确认发送，交给智能体检查当前窗口') from None
         if result.returncode:raise RuntimeError('Windows OCR 未完成；未继续发送，请检查中文 OCR 语言组件')
@@ -57,20 +57,50 @@ def send_message(computer,recipient,text,cancel,prepare_only=False,chat=None):
         obs=computer.execute(dict(action='observe',hwnd=hwnd),cancel)
         return obs,read_frame(obs)
     obs,ocr=observe();width,height=obs['image_size']
+    keyboard_picked=False
     if not chat:
-        search_words=[w for w in phrase_boxes(ocr,'搜索') if w['x']<width*.35 and w['y']<height*.25]
-        if not search_words:raise RuntimeError('未定位微信顶部搜索框；未发送')
-        search=search_words[0]
-        computer.execute(dict(action='fill',observation_id=obs['observation_id'],x=int(search['x']+search['width']/2),y=int(search['y']+search['height']/2),text=recipient),cancel)
-        cancel.wait(.4);obs,ocr=observe()
+        # 优先用微信内置快捷键聚焦搜索框，不依赖 OCR 认出"搜索"两个字
+        # （微信新版搜索框只有放大镜图标，OCR 经常漏掉）。
+        typed=False
+        try:
+            computer.execute(dict(action='hotkey',observation_id=obs['observation_id'],keys='ctrl+f'),cancel)
+            cancel.wait(.35);obs,ocr=observe()
+            computer.execute(dict(action='type',observation_id=obs['observation_id'],text=recipient,replace=True,clear=True),cancel)
+            typed=True
+        except Exception:
+            typed=False
+        if not typed:
+            search_words=[w for w in phrase_boxes(ocr,'搜索') if w['x']<width*.35 and w['y']<height*.25]
+            if not search_words:raise RuntimeError('未定位微信顶部搜索框；未发送')
+            search=search_words[0]
+            computer.execute(dict(action='fill',observation_id=obs['observation_id'],x=int(search['x']+search['width']/2),y=int(search['y']+search['height']/2),text=recipient),cancel)
+        cancel.wait(.7);obs,ocr=observe();width,height=obs['image_size']
         contacts=[box for box in phrase_boxes(ocr,compact(recipient)) if box['x']<width*.35 and box['y']>height*.13]
-        if not contacts:raise RuntimeError('搜索结果未找到匹配聊天对象；未输入或发送')
-        contact=min(contacts,key=lambda box:box['y'])
-        computer.execute(dict(action='click',observation_id=obs['observation_id'],x=int(contact['x']+contact['width']/2),y=int(contact['y']+contact['height']/2)),cancel)
-        cancel.wait(.2);obs,ocr=observe();width,height=obs['image_size']
+        keyboard_picked=False
+        if not contacts:
+            # OCR 只装了中文/英文模型，认不出日文假名、韩文、emoji 这类名字。
+            # 这种情况下退回键盘路径：搜索框里输入后按 ↓ 选中第一个结果、回车进入。
+            if not any(ord(c)>0x7F for c in recipient):
+                raise RuntimeError('搜索结果未找到匹配聊天对象；未输入或发送（若聊天输入框里留下了草稿，请手动清掉）')
+            # 用点击而不是 ↓+Enter：微信搜索结果里按 ↓ 会选中"群聊"那一条，直接进错会话。
+            # 搜索面板布局固定：「联系人」分组在最上面，第一条就在 height*0.18 附近。
+            grp=[w for w in phrase_boxes(ocr,'联系人') if w['x']<width*.35 and w['y']<height*.25]
+            ty=int(grp[0]['y']+max(38,height*.055)) if grp else int(height*.18)
+            try:computer.execute(dict(action='click',observation_id=obs['observation_id'],x=int(width*.22),y=ty),cancel)
+            except Exception:pass
+            cancel.wait(.5);obs,ocr=observe();width,height=obs['image_size']
+            keyboard_picked=True
+        else:
+            contact=min(contacts,key=lambda box:box['y'])
+            computer.execute(dict(action='click',observation_id=obs['observation_id'],x=int(contact['x']+contact['width']/2),y=int(contact['y']+contact['height']/2)),cancel)
+            cancel.wait(.2);obs,ocr=observe();width,height=obs['image_size']
     # Require the actual conversation header, not a matching sidebar contact.
     header=any(box['x']>width*.2 and box['y']<height*.23 for box in phrase_boxes(ocr,compact(recipient)))
-    if not header:raise RuntimeError('顶部会话名未验证为指定对象，未输入或发送')
+    if not header and not keyboard_picked:raise RuntimeError('顶部会话名未验证为指定对象，未输入或发送')
+    if not header and keyboard_picked:
+        # 键盘选中结果、但标题全是 OCR 认不出的字符：不谎报"已核对"，交给人看截图。
+        return dict(ok=True,verified=False,recipient=recipient,hwnd=hwnd,_image_url=obs['_image_url'],
+            message='已用键盘选中第一个搜索结果并进入会话，但标题含 OCR 认不出的字符，未能逐字核对；请核对截图确认是不是对的人，再调用 send')
     if prepare_only:return dict(ok=True,ready_for_message=True,recipient=recipient,hwnd=hwnd,_image_url=obs['_image_url'],message='已进入首个匹配会话并核对标题；现在根据用户要求组织正文，再调用send')
     input_words=[w for w in phrase_boxes(ocr,'发送') if w['y']>height*.6]
     if not input_words:raise RuntimeError('未识别微信发送按钮；未继续输入')
