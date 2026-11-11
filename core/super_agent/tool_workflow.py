@@ -110,6 +110,8 @@ def validate(spec, tools=None):
 
 def load(slug, root=None):
     path = Path(root or DEFAULT_DIR) / (slug + '.json')
+    if root is None and not path.is_file() and slug=='tencent-meeting-to-bilibili':
+        path=Path(__file__).resolve().parents[2]/'resources/workflows/tencent-meeting-to-bilibili.json'
     if not path.is_file():
         raise ToolWorkflowError('没有找到工具型工作流 %r（%s）' % (slug, path))
     try:

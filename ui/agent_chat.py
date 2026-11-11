@@ -280,6 +280,7 @@ class AgentChatWindow(QDialog):
         return rendered,codes
 
     def render(self):
+        self.refresh_companion_header()
         from core.chat_presentation import is_progress_ack
         messages = self.store.messages(self.active_id)
         hidden=[m for m in messages if m['role'] in ('tool','system') or
@@ -289,9 +290,14 @@ class AgentChatWindow(QDialog):
         visible=[m for m in messages if m not in hidden or self.logs_visible]
         if self._answer_text:visible.append(dict(id='draft',role='assistant',content=self._answer_text))
         if not visible:
-            self.view.setHtml('<div style="margin-top:95px;text-align:center;color:#303a50">'
-                '<p style="font-size:34px">🐧</p><p style="font-size:20px;font-weight:600">有什么想和咕嘎聊聊？</p>'
-                '<p style="color:#9aa1ae;font-size:12px;line-height:1.9">问个问题，或者交给我一件小事。<br>也可以截图提问、随时开始语音。</p></div>')
+            from ui.companion_widgets import ARTWORK
+            from PyQt5.QtCore import QUrl
+            artwork=QUrl.fromLocalFile(str(ARTWORK[self.active_agent_id])).toString()
+            name=html.escape(self.active_profile['display_name'])
+            address=html.escape(self.active_profile.get('user_address') or '饲养员')
+            self.view.setHtml('<div style="margin-top:40px;text-align:center;color:#303a50">'
+                '<p><img src="'+artwork+'" height="110"></p><p style="font-size:22px;font-weight:600">'+address+'，'+name+'在这里</p>'
+                '<p style="color:#8b97ac;font-size:13px;line-height:1.9">聊聊想法，解释一段文字，或交给我一件事。<br>常做的工作，可以一起写成下一次直接复用的流程。</p></div>')
             return
         parts=[]
         self._copy_store={}
@@ -410,6 +416,7 @@ class AgentChatWindow(QDialog):
         if not profile:raise ValueError('未知咕嘎编号')
         if str(agent_id)==self.active_agent_id:
             self.active_profile=profile
+            self.refresh_companion_header()
             return True
         if self.busy or self.voice_active:
             self.status.setText('请先结束当前任务或长语音，再切换另一位咕嘎')
@@ -421,6 +428,26 @@ class AgentChatWindow(QDialog):
         ident=saved if saved in ids else (ids[0] if ids else self.store.create_conversation(agent_id=self.active_agent_id,name=profile['role']+'对话'))
         self.open_conversation(ident);self.status.setText('已切换到 '+profile['display_name']+' · '+profile['role'])
         return True
+
+    def refresh_companion_header(self):
+        for ident,button in getattr(self,'member_buttons',{}).items():
+            button.setChecked(ident==self.active_agent_id)
+        if hasattr(self,'model_label'):
+            self.model_label.setText(self.active_profile['display_name']+' · '+self.active_profile['role']+'  /  记住习惯，陪你把事情做好')
+
+    def open_companion_settings(self,agent_id=None,tab=0):
+        from ui.companion_settings import CompanionSettings
+        dialog=CompanionSettings(self,agent_id or self.active_agent_id,tab)
+        self._companion_settings=dialog;dialog.show();dialog.raise_()
+        return dialog
+
+    def optimize_composer(self):
+        from ui.screen_tools import ExplainDialog
+        text=self.editor.toPlainText().strip()
+        if not text:self.status.setText('先写下想优化的提示词，再点击「优化」');return
+        dialog=ExplainDialog(self);self._prompt_optimizer=dialog
+        dialog.apply_requested.connect(self.editor.setPlainText)
+        dialog.apply_button.show();dialog.load(text,mode='optimize')
 
     def new_project(self):
         name, ok = QInputDialog.getText(self, '新建项目', '项目名称')

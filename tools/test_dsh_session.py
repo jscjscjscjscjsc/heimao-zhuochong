@@ -37,6 +37,10 @@ class FakeGateway(gw.DshGateway):
     def resolve_session_id(self, session_id):
         return str(session_id)
 
+    def ensure_full_access(self,session_id):
+        self.permission_checked=session_id
+        return dict(ok=True,currentValue='full-access')
+
 
 class GatewayToolSurfaceTests(unittest.TestCase):
     """"在 DSH 里开个新对话"必须是模型看得见的工具动作。
@@ -78,6 +82,7 @@ class SessionCreateTests(unittest.TestCase):
         self.assertTrue(result['ok'])
         self.assertEqual(result['session_id'], 'session-abc')
         self.assertEqual(result['agent_preset'], 'standard')
+        self.assertEqual(client.permission_checked,'session-abc')
         self.assertIn('session-abc', gw.owned_sessions())
         self.assertEqual(gw.owner_of('session-abc'), 'conv-1')
         self.assertEqual(client.calls[0][0], 'session/create')

@@ -21,6 +21,8 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONUTF8: '1'
+      GUGA_SUPER_AGENT: 'off'
+      GUGA_LINGSHU: 'off'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -36,22 +38,7 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q core ui tools launcher.py main.py
       - name: Run desktop, memory, daily-plan and voice regressions
-        run: >-
-          python -m unittest
-          tools.test_independent_chat
-          tools.test_companion_chat
-          tools.test_companion_memory
-          tools.test_driver_voice_repair
-          tools.test_floating_chat
-          tools.test_fresh_context
-          tools.test_recording_draft
-          tools.test_realtime_voice
-          tools.test_long_voice_stability
-          tools.test_voice_resilience
-          tools.test_voice_conversation_controls
-          tools.test_daily_plan
-          tools.test_super_agent_tools
-          -v
+        run: python -X utf8 tools/run_desktop_ci.py
 
   plugin:
     name: Plugin contract tests

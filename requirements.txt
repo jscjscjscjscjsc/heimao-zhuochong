@@ -17,3 +17,4 @@ kaldi-native-fbank>=1.22.4
 playwright>=1.49
 markdown-it-py>=3.0
 pygments>=2.15
+PyYAML>=6.0
