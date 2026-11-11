@@ -36,10 +36,11 @@ def build(panel):
         QFrame#Composer {background:#f8f9fd;border:1px solid #e2e7f1;border-radius:16px;}
         QPlainTextEdit {background:transparent;border:0;padding:4px;font-size:13px;selection-background-color:#cfdbff;}
         QTextBrowser {background:white;border:0;font-size:13px;selection-background-color:#dbe5ff;}
-        QTreeWidget {background:transparent;border:0;outline:0;font-size:12px;}
+        QTreeWidget {background:transparent;border:0;outline:0;font-size:12px;selection-background-color:#e5ebfb;selection-color:#435bb0;}
         QTreeWidget::item {padding:9px 3px;border-radius:8px;}
         QTreeWidget::item:selected {background:#e5ebfb;color:#435bb0;}
         QTreeWidget::branch {background:transparent;}
+        QTreeWidget::branch:selected {background:#e5ebfb;}
         QCheckBox {font-size:11px;color:#8b909c;}
         QComboBox {border:1px solid #e5e8ee;border-radius:7px;padding:4px 8px;background:white;font-size:11px;}
         QMenu {background:white;border:1px solid #e2e5eb;padding:6px;}
