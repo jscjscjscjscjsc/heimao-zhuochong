@@ -162,8 +162,22 @@ class BrowserWorker:
                 self.playwright=sync_playwright().start()
                 profile=Path(os.environ.get('GUGA_BROWSER_PROFILE_DIR',str(ROOT/'runtime/browser-profile')))
                 profile.mkdir(parents=True,exist_ok=True)
-                self.context=self.playwright.chromium.launch_persistent_context(str(profile),headless=bool(args.get('headless',False)),
-                    accept_downloads=True,viewport=dict(width=1280,height=900),timeout=15000)
+                launch_options=dict(headless=bool(args.get('headless',False)),accept_downloads=True,
+                    viewport=dict(width=1280,height=900),timeout=15000)
+                try:
+                    self.context=self.playwright.chromium.launch_persistent_context(str(profile),**launch_options)
+                except Exception as chromium_error:
+                    # Public installs may not be able to download Playwright's
+                    # bundled Chromium. Windows ships Edge with the Chromium
+                    # DevTools protocol, so keep the owned-browser feature usable.
+                    if os.name!='nt':raise
+                    try:
+                        self.context=self.playwright.chromium.launch_persistent_context(
+                            str(profile),channel='msedge',**launch_options)
+                    except Exception as edge_error:
+                        raise RuntimeError(
+                            'Playwright Chromium不可用，Microsoft Edge回退也失败；'
+                            '请确认Edge已安装并可正常启动') from edge_error
                 self.context.set_default_timeout(4000);self.context.set_default_navigation_timeout(12000)
                 self.context.on('dialog',lambda dialog:dialog.dismiss())
                 page=self.context.pages[0] if self.context.pages else self.context.new_page()
