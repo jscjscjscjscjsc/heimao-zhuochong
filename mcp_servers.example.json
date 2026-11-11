@@ -7,6 +7,30 @@
       "allowed_tools": ["get_status", "create_note", "delete_note", "send_message"],
       "routine_tools": ["get_status", "create_note"],
       "confirmation_tools": ["delete_note", "send_message"]
+    },
+    "dsh-bridge": {
+      "_note": "把 DSH 当成 MCP 服务端来用。已在 web profile 装好 dsh-as-mcp-server@0.1.4（插件 id dsh-mcp-bridge），重启 DSH 后它会在 127.0.0.1:51630/mcp 起 Streamable HTTP 端点。实测的参数（不要猜）：dsh_set_intent 必填 text；dsh_lock_acquire/release 必填 owner；dsh_inject_alert 必填 message；dsh_review_request 必填 title。",
+      "enabled": false,
+      "url": "http://127.0.0.1:51630/mcp",
+      "timeout": 20,
+      "allowed_tools": [
+        "dsh_get_status",
+        "dsh_get_intent",
+        "dsh_lock_status",
+        "dsh_review_request"
+      ],
+      "routine_tools": [
+        "dsh_get_status",
+        "dsh_get_intent",
+        "dsh_lock_status"
+      ],
+      "confirmation_tools": [
+        "dsh_set_intent",
+        "dsh_lock_acquire",
+        "dsh_lock_release",
+        "dsh_inject_alert",
+        "dsh_review_request"
+      ]
     }
   }
 }

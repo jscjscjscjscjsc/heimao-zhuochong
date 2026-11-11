@@ -9,6 +9,8 @@ from core import chat_memory
 
 class MemoryRecallTests(unittest.TestCase):
     def setUp(self):
+        environment=patch.dict(os.environ,{'GUGA_LINGSHU':'on'})
+        environment.start();self.addCleanup(environment.stop)
         chat_memory._CACHE.clear();chat_memory._INFLIGHT=None
 
     def test_cache_is_query_specific_and_other_member_does_not_receive_shared_memory(self):

@@ -109,7 +109,15 @@ class AuthorizedApps:
             alias=next((value for key,value in SCRIPT_ALIASES.items() if normalized in (key,key+'脚本',key+'的脚本')),None)
             if alias and alias.is_file():target=alias
             elif not self.access.enabled or not target.is_absolute() or target.suffix.lower() not in ('.exe','.lnk','.bat','.cmd','.ps1'):
-                raise AppResolutionError('未找到名为“'+str(name)[:80]+'”的软件；已检查运行窗口和可用软件名称。请提供准确名称或软件路径')
+                # 报"没找到"就结束，模型只会卡在这里重复试。这里把可选项和正确出路一起给它。
+                head=str(name)[:2]
+                nearby=[key for key in entries if head and head in key][:6] or list(entries)[:6]
+                raise AppResolutionError(
+                    '未找到名为“%s”的软件。当前可用的软件有：%s。'
+                    '如果用户要打开的是**网站/网页**（B站、豆包、腾讯会议网页版等），请改用 browser 工具，不要用 applications；'
+                    '如果是中文别名启动，用 desktop_command；'
+                    '只有确定是本机已安装的软件才用 applications。' % (
+                        str(name)[:80], '、'.join(nearby) or '（没有已授权软件）'))
         else:
             target = Path(entries[name])
         if not target.is_file():

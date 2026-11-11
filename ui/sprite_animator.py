@@ -124,6 +124,12 @@ class SpriteAnimator:
         self._prev_expression = "normal"
         self._transition = 1.0
         self._transition_speed = 0.06
+        # 常驻动画链：一段原生片段放完立刻接下一段，并做 250ms 交叉淡入。
+        # 这才是"常态是动态表情"——不是静止贴图 + 偶尔播一段。
+        self._idle_chain = True
+        self._xfade_pm = None
+        self._xfade_t = 1.0
+        self._xfade_seconds = 0.25
 
         # 企鹅动画参数
         self.breath_y = 0.0
@@ -305,12 +311,13 @@ class SpriteAnimator:
                 clip='idle:'+name;self._load_action_frames(clip,str(folder),fps,lazy=True,
                     reference_width=spec.get('reference_width'))
                 if clip in self.clips:self.idle_motion_clips.append((name,max(.01,float(spec.get('weight',1)))))
-            if manifest.get('padded_canvas') and len(self.idle_motion_clips)!=4:
-                for name,_ in self.idle_motion_clips:self.clips.pop('idle:'+name,None)
-                self.idle_motion_clips=[]
-                self._load_idle_clips(Path(self._res_dir)/'actions/idle-motion')
-                return
-            if manifest.get('padded_canvas') and len(self.idle_motion_clips)==4:
+            if manifest.get('padded_canvas'):
+                # 以前是"少于 4 个片段就整组丢弃、退回 idle-motion（245×352、无扩边、按适配盒缩放）"，
+                # 于是通过审核的高质量素材一个都没用上，看起来就跟静态立绘不是同一图层。
+                # 现在按真正通过审核的片段来用，扩边与 reference_width 口径保持不变。
+                if not self.idle_motion_clips:
+                    self._load_idle_clips(Path(self._res_dir)/'actions/idle-motion')
+                    return
                 self._resident_pad=(round(self._dw*40/245),round(self._dw*60/245))
                 self.width=self._dw+2*self._resident_pad[0]
                 self.height=self._dh+self._resident_pad[1]+round(self._dw*12/245)
@@ -433,6 +440,17 @@ class SpriteAnimator:
         self.clips['wave'] = {'type': 'track', 'loop': False, 'fps': 8.0,
                               'frames': [(0, 1.0, -6), (0, 1.0, 0), (0, 1.0, 6), (0, 1.0, 0)]}
 
+    def _start_next_idle_motion(self):
+        """接下一段原生常驻片段（避开刚播过的那段）。"""
+        choices = [(n, w) for n, w in self.idle_motion_clips if n != self._last_idle_motion]
+        if not choices:
+            choices = list(self.idle_motion_clips)
+        if not choices:
+            return
+        names = [n for n, _ in choices]
+        weights = [max(.01, w) for _, w in choices]
+        self.play_clip('idle:' + random.choices(names, weights=weights, k=1)[0], loop=False)
+
     def play_clip(self, name, loop=None):
         if name.startswith('task:') and not self._reference_clips_enabled:return
         if name.startswith('idle:') and not self._idle_motion_enabled:return
@@ -440,6 +458,11 @@ class SpriteAnimator:
             return
         if name.startswith('idle:'):
             if self._idle_motion_blocked():return
+            # 上一段的最后一帧留作交叉淡入的起点，避免硬切（这就是"衔接不自然"的来源）
+            previous = self._last_native_pm
+            if previous is not None and (self._clip or '').startswith('idle:'):
+                self._xfade_pm = previous
+                self._xfade_t = 0.0
             self._last_idle_motion=name[5:]
             self._idle_rest=None
             self._last_native_pm=None
@@ -641,6 +664,12 @@ class SpriteAnimator:
             t_ease = 1 - (1 - self._transition) ** 3
             self._transition = min(1.0, self._transition + (self._transition_speed + t_ease * 0.02)*dt*30)
 
+        # 常驻片段的交叉淡入进度（250ms）
+        if self._xfade_t < 1.0:
+            self._xfade_t = min(1.0, self._xfade_t + dt / max(0.05, self._xfade_seconds))
+            if self._xfade_t >= 1.0:
+                self._xfade_pm = None
+
         # ---- 眨眼（normal/happy）----
         if self.expression in ("normal", "happy") and self._transition > 0.5:
             self._blink_countdown -= dt
@@ -722,6 +751,13 @@ class SpriteAnimator:
                 self.temporary_expression(random.choice(['playful', 'surprised', 'happy']),
                                           random.uniform(1.0, 2.2))
 
+        # ---- 常驻连续动画（核心：常态也要是动的）----
+        if (not self._task_motion.active and self.expression != 'sleepy' and
+                self._context_expression in (None,'happy') and self._temporary_expression is None and
+                self.action == "none" and not self._idle_motion_blocked() and self._clip in (None, 'idle')):
+            if self._idle_chain and self.idle_motion_clips:
+                self._start_next_idle_motion()
+
         # ---- 随机小动作（让企鹅活起来）----
         if (not self._task_motion.active and random.random() < 0.024*dt and self.expression == "normal" and
                 self.action == "none" and self._clip in (None,'idle')):
@@ -751,9 +787,13 @@ class SpriteAnimator:
                     # instead of leaving an unattended pet dancing forever.
                     self.play_clip(self.DANCE_CLIP, loop=False)
 
+        # 原生序列帧（24fps 的 idle/task 片段、GIF 表情、舞蹈）必须按活跃帧率跑。
+        # 10fps 的空闲档只适合程序化的 6fps 呼吸轨；套在 24fps 素材上会丢掉一半多的帧，
+        # 看起来就是"自然状态比动图卡、还抖"。
+        native_clip = bool((self.clips.get(self._clip or '') or {}).get('type') == 'frames')
         energetic=bool(self._speaking or self.mouth_open>.05 or self.action!='none' or self.dancing or
             self._task_motion.active or self._temporary_expression is not None or self._being_dragged or
-            self._transition<1 or self._clip not in (None,'idle') or self._tap_elapsed<1.0)
+            self._transition<1 or self._clip not in (None,'idle') or self._tap_elapsed<1.0 or native_clip)
         target=self._active_interval_ms if energetic else self._idle_interval_ms
         if self._timer.interval()!=target:self._timer.setInterval(target)
         if self.on_update:
@@ -914,7 +954,14 @@ class SpriteAnimator:
                 anchor_x=x+self._dw/2;anchor_y=y+self._dh
                 p.translate(anchor_x,anchor_y);p.scale(breath,breath);p.translate(-anchor_x,-anchor_y)
             margin=self._dw*8/245 if self._resident_pad!=(0,0) else 0
+            if self._xfade_pm is not None and self._xfade_t < 1.0:
+                old = self._xfade_pm
+                p.setOpacity(max(0.0, 1.0 - self._xfade_t))
+                p.drawPixmap(int(x+(self._dw-old.width())/2),
+                             int(y+self._dh-old.height()+margin), old)
+                p.setOpacity(self._xfade_t)
             p.drawPixmap(int(x+(self._dw-pm.width())/2),int(y+self._dh-pm.height()+margin),pm)
+            p.setOpacity(1.0)
             if self.sunglasses:self._draw_sunglasses(p,x,y)
             p.restore();return
 

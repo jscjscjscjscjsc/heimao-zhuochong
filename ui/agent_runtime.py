@@ -135,9 +135,84 @@ class AppRuntime:
                     text=str(args.get('text') or '').strip()
                     if not session_id or not text:raise ValueError('prompt 需要 session_id 与 text（不允许猜目标会话）')
                     return dict(ok=True,**client.prompt(session_id,text,mode=args.get('mode') or 'queue'))
+                if action in ('create','new','new_session'):
+                    # 新建一个空会话。这是"在 DSH 里开个新对话"的正路，
+                    # 不需要去 DSH 窗口里用电脑控制点按钮（那条路会因为窗口没焦点失败）。
+                    created=client.create_session()
+                    session_id=str(created.get('session_id') or '')
+                    if not session_id:
+                        raise RuntimeError('网关没有返回新的 session_id')
+                    return dict(ok=True,session_id=session_id,created=True,**created)
+                if action=='start':
+                    text=str(args.get('text') or '').strip()
+                    if not text:raise ValueError('start 需要 text：第一条要投递给新会话的指令')
+                    created=client.start_task(text,mode=args.get('mode') or 'queue')
+                    return dict(ok=True,**created)
             except Exception as exc:
                 return dict(ok=False,error=type(exc).__name__+': '+str(exc)[:300])
             raise ValueError('未知 DSH 网关操作')
+        if name=='workflow':
+            from core import action_workflow as aw
+
+            def _tool_workflow_names():
+                from core.super_agent import tool_workflow as tw
+                if not tw.DEFAULT_DIR.is_dir():return []
+                return sorted(path.stem for path in tw.DEFAULT_DIR.glob('*.json'))
+
+            def _tool_workflow_runs():
+                from core.super_agent import tool_workflow as tw
+                return tw.last_runs()
+            action=str(args.get('action','list')).strip().lower()
+            try:
+                store=aw.WorkflowStore()
+                if action=='plan':
+                    # 工具调用型工作流（browser/local_computer/media_workflow 组合）：只做静态校验
+                    from core.super_agent import tool_workflow as tw
+                    slug=str(args.get('slug') or '').strip()
+                    if not slug:raise ValueError('plan 需要 slug（action=list 会列出可用的）')
+                    return dict(ok=True,**tw.dry_run(tw.load(slug)))
+                if action=='run':
+                    # 按步执行工具调用型工作流：确认闸默认停下，任何一步失败即停
+                    from core.super_agent import tool_workflow as tw
+                    slug=str(args.get('slug') or '').strip()
+                    if not slug:raise ValueError('run 需要 slug（action=list 会列出可用的）')
+                    return tw.run(tw.load(slug), lambda tool,arguments: self.execute(tool,arguments),
+                        allow_confirm=bool(args.get('allow_confirm')),
+                        allow_dangerous=bool(args.get('allow_dangerous')),
+                        start_at=int(args.get('start_at') or 1),
+                        ledger=tw.DEFAULT_DIR/'receipts.jsonl')
+                if action in ('list','status'):
+                    rows=[]
+                    for path in sorted(store.root.glob('*.json')):
+                        try: wf=store.load(path.stem)
+                        except Exception: continue
+                        if action=='status' and str(args.get('slug') or '').strip() and wf.get('slug')!=str(args.get('slug')).strip():
+                            continue
+                        rows.append(dict(slug=wf.get('slug'), name=wf.get('name'),
+                            steps=len(wf.get('steps') or []),
+                            triggers=list(wf.get('trigger_phrases') or [])[:4],
+                            success=int(wf.get('success_count') or 0),
+                            failure=int(wf.get('failure_count') or 0),
+                            last_ok=bool(wf.get('last_ok_at'))))
+                    return dict(ok=True,total=len(rows),workflows=rows,root=str(store.root),
+                        tool_workflows=_tool_workflow_names(),
+                        tool_workflow_runs=_tool_workflow_runs())
+                if action=='play':
+                    slug=str(args.get('slug') or '').strip()
+                    if not slug:raise ValueError('play 需要 slug（先用 action=list 查有哪些）')
+                    report=aw.play_workflow(slug,dry_run=bool(args.get('dry_run')))
+                    return dict(ok=bool(report.get('ok')),slug=slug,report=report)
+                if action=='compile':
+                    text=str(args.get('text') or '').strip()
+                    if not text:raise ValueError('compile 需要 text：把要做的那套操作完整说出来')
+                    triggers=[t.strip() for t in str(args.get('triggers') or '').replace('，',',').split(',') if t.strip()]
+                    wf=aw.compile_from_text(text,name=args.get('title') or None,
+                        trigger_phrases=triggers or None,slug=args.get('slug') or None)
+                    return dict(ok=True,slug=wf.get('slug'),name=wf.get('name'),
+                        steps=len(wf.get('steps') or []),workflow=wf)
+                raise ValueError('未知工作流操作')
+            except Exception as exc:
+                return dict(ok=False,error=type(exc).__name__+': '+str(exc)[:300])
         if name=='screen_share':
             action=args.get('action')
             if action=='start':
@@ -203,6 +278,60 @@ class AppRuntime:
             raise ValueError('未知音乐操作')
         if name=='media_workflow':
             return self.media.execute(dict(args),self.panel.agent.cancel_event)
+        if name=='code_task':
+            # 把"改一个项目"交给本机 DSH 跑；这个 handler 会阻塞很久，所以后台线程起飞、status 查结果
+            import threading, time as _time
+            action=str(args.get('action','run')).strip().lower()
+            if action=='status':
+                job=dict(getattr(self,'_code_job',None) or {})
+                return dict(ok=True, job=job)
+            if action=='stop':
+                cancel=getattr(self,'_code_cancel',None)
+                if not cancel or not (getattr(self,'_code_job',None) or {}).get('running'):
+                    return dict(ok=True, stopped=None, message='没有正在跑的编码任务')
+                cancel.set()
+                return dict(ok=True, stopping=True,
+                            message='已请求中止；DSH 会话里已做的改动不会自动回滚，需要你自己看')
+            if action=='run':
+                from core.coding_agent import CodingAgent, write_receipt
+                job=getattr(self,'_code_job',None) or {}
+                if job.get('running'):raise RuntimeError('已经有一个编码任务在跑；先 action=status 看进度')
+                task=str(args.get('task') or '').strip()
+                cwd=str(args.get('cwd') or '').strip() or str(self.panel.store.root if hasattr(self.panel.store,'root') else '')
+                if not task:raise ValueError('code_task 需要 task：说清要改什么')
+                if not cwd:raise ValueError('code_task 需要 cwd：项目目录绝对路径')
+                check_cmd=str(args.get('check_cmd') or '').strip() or None
+                fresh=str(args.get('fresh') or '').strip().lower() in ('1','true','yes')
+                sessions=getattr(self,'_code_sessions',None)
+                if sessions is None:
+                    sessions={}; self._code_sessions=sessions
+                # 同一个项目再来一次就复用上次的会话：上下文不丢，也不在 DSH 里堆一串不结束的会话
+                reuse=None if fresh else sessions.get(cwd)
+                cancel=threading.Event()
+                self._code_cancel=cancel
+                self._code_job=dict(running=True, ok=None, session_id=reuse or '', answer='', cwd=cwd,
+                                    started=_time.time(), task=task[:300], check_cmd=check_cmd or '',
+                                    reused=bool(reuse))
+                holder=self._code_job
+                def work():
+                    try:
+                        report=CodingAgent().run(task, cwd, check_cmd=check_cmd,
+                                                 cancel=cancel, session_id=reuse)
+                        report.setdefault('task', task[:200])
+                        if report.get('session_id'):
+                            sessions[cwd]=report['session_id']
+                        holder.update(report, running=False)
+                        try:
+                            write_receipt(report)
+                        except OSError:
+                            pass   # 台账写不进去不能影响任务结果
+                    except Exception as exc:
+                        holder.update(running=False, ok=False,
+                                      error=type(exc).__name__+': '+str(exc)[:300])
+                threading.Thread(target=work, name='guga-code-task', daemon=True).start()
+                return dict(ok=True, accepted=True, cwd=cwd, reused=bool(reuse),
+                            message='已交给本机 DSH 跑，用 action=status 查；终态才有结论，受理不等于做完')
+            raise ValueError('未知编码操作')
         if name == 'dsh_task':
             action=args.get('action')
             if action=='status':return self.dsh.status()
@@ -232,7 +361,11 @@ class AppRuntime:
             if args.get('action')=='command':
                 from core.fast_commands import match
                 text=str(args.get('name',''))
-                if not match(text).get('matched'):raise ValueError('仅支持已识别的本地快速命令；本操作不会转交大模型')
+                if not match(text).get('matched'):
+                    # 反射动作与已录好的长任务工作流同样走本地零模型通道。
+                    from core.reflex import match as reflex_match
+                    if not reflex_match(text).get('matched'):
+                        raise ValueError('仅支持已识别的本地快速命令或已录好的工作流；本操作不会转交大模型')
                 import uuid
                 if self.panel.busy or getattr(self.panel,'_fast_inflight',False):
                     raise RuntimeError('咕嘎正在执行其他任务，本次未提交快速命令')
@@ -338,7 +471,7 @@ class AppRuntime:
                             desktop_control=dict(version=ROUTER_VERSION,mode='foreground_single_step',
                                 task_model=False,numbered_targets=True,visual_fallback='on_native_target_missing',
                                 success_feedback='immediate_bubble_no_audio',automatic_retry=False,
-                                workflow_recording=False),
+                                workflow_recording=True),
                             conversation=dict(mode='awake' if self.panel.voice_active else 'companion',
                                 companion_interval_seconds=self.panel.proactive.interval_seconds,
                                 news_refresh_seconds=self.panel.proactive.news_refresh_seconds,

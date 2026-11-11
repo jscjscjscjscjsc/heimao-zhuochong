@@ -226,10 +226,17 @@ def match(text):
     match=re.fullmatch(r'(?:打开|启动)(?:一下)?\s*(.+)',value)
     if match:
         target=re.sub(r'(?:一下|好吗|可以吗|吗|吧)$','',match.group(1).strip()).strip()
+        # "打开我的b站"——口语里的"我的"不是软件名的一部分，先剥掉再按站点认
+        bare=re.sub(r'^(?:我的|我那个|那个|咱的)', '', target).strip()
+        if bare and bare.casefold() in SITE_ALIASES:
+            return dict(prefix,matched=True,action='open_url',silent=True,priority='fast',
+                        kind='url',target=SITE_ALIASES[bare.casefold()])
         if target in BROWSER_NAMES:
             return dict(prefix,matched=True,action='open_app',silent=True,priority='fast',kind='app',target='浏览器')
-        if target and len(target)<=80 and not re.search(
-                r'然后|接着|并且|再帮|并|不要|如果|输入|打字|填写|写入|写一|写个|撰写|保存|发送|搜索|查找|找到|编辑|点击|登录|录入|修复|安装|下载|网站|网页|网址|官网|是什么|什么意思|为什么|怎么|如何|会怎样|会怎么样|[，,。;；：:]|[?？]',target):
+        if target and len(target)<=20 and not re.search(
+                r'然后|接着|并且|再帮|并|不要|如果|输入|打字|填写|写入|写一|写个|撰写|保存|发送|搜索|查找|找到|编辑|点击|登录|录入|修复|安装|下载|网站|网页|网址|官网|是什么|什么意思|为什么|怎么|如何|会怎样|会怎么样'
+                r'|在|后|以后|之后|里面|里|中|新建|创建|建一个|对话|会话|消息|发给|说|问|告诉|帮我|请|一下'
+                r'|[，,。;；：:]|[?？]',target):
             # Resolve installed apps on the existing launch worker, never scan
             # the Start Menu on Qt/voice threads or require a duplicate grant.
             return dict(prefix,matched=True,action='open_app',silent=True,priority='fast',kind='app',target=target)

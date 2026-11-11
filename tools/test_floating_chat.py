@@ -51,7 +51,7 @@ class FloatingTests(unittest.TestCase):
     def image(self):
         p=QPixmap(480,180);p.fill(Qt.white);q=QPainter(p);q.setPen(QColor('#273b50'));q.setFont(QFont('Microsoft YaHei UI',24));q.drawText(25,95,'完成 3 / 5 项');q.end();return p
     def test_compact_shell_and_collapsed_records(self):
-        p=self.panel;self.assertTrue(p.sidebar.isHidden());self.assertGreaterEqual(p.width(),520);self.assertLessEqual(p.width(),800)
+        p=self.panel;self.assertFalse(p.sidebar.isHidden());self.assertGreaterEqual(p.width(),760);self.assertLessEqual(p.width(),1200)
         for role,text in [('user','帮我打开网站'),('tool','SECRET_TOOL_BODY'),('system','后台摘要'),('assistant','已打开你指定的网站。')]:p.store.append(p.active_id,role,text)
         p.render();self.assertIn('已打开',p.view.toPlainText());self.assertNotIn('SECRET_TOOL_BODY',p.view.toPlainText())
         p._toggle_logs(True);self.assertIn('SECRET_TOOL_BODY',p.view.toPlainText())
@@ -179,7 +179,7 @@ class FloatingTests(unittest.TestCase):
     def test_text_toolbar_has_explain_and_screenshot_analysis(self):
         from PyQt5.QtWidgets import QPushButton
         labels=[b.text() for b in self.pet._screen_tools.selection_bar.findChildren(QPushButton)]
-        self.assertIn('解释',labels);self.assertIn('截图提问',labels);self.assertNotIn('翻译',labels)
+        self.assertIn('解释',labels);self.assertIn('截图提问',labels);self.assertIn('翻译',labels);self.assertIn('优化提示词',labels)
 
     def test_pet_menu_exposes_natural_videos_and_drops_legacy_shapes(self):
         from PyQt5.QtWidgets import QMenu

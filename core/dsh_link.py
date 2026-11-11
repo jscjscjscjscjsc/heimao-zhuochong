@@ -1,4 +1,5 @@
 """Read-only task facts from the independent native DSH host, isolated by session."""
+import threading
 import time
 from collections import OrderedDict
 from PyQt5.QtCore import QObject,QTimer
@@ -17,6 +18,37 @@ _ACTION_WORDS = (
     ('mcp__guga__screen_share', '帮你看着屏幕'),
 )
 _OPENERS = ('主人～', '跟你汇报下哈～', '进度来啦～', '我跟你讲哦～')
+# 主人 2026-11-11 要求：聚焦 DSH 正在跑的那个任务，每隔 1 分钟用自然语言汇报一次。
+# 节奏是固定的，不再由「里程碑工具」触发——否则要么太吵，要么一分钟都没一句。
+_NARRATE_SECONDS = 60
+# 模型组织那句话可能还没回来；最多等这么久，超时就退回确定性文案。
+# 实测 opencode 这条路由组织一句中文要 5—9 秒（含推理），7 秒会把好句子丢掉，
+# 所以放宽到 15 秒——每分钟才一次汇报，等一下完全值得。
+_DIGEST_WAIT_SECONDS = 15
+# DSH 自己的工具名 → 中文动作词。按「具体在前、笼统在后」排，避免 write 抢了 todo_write。
+_DSH_TOOL_WORDS = (
+    ('todo_write', '排任务清单'),
+    ('read_image', '看图片'),
+    ('str_replace', '改代码'),
+    ('working_directory', '确认工作目录'),
+    ('team_task', '排团队任务'),
+    ('send_message', '跟队友通气'),
+    ('wait_agent', '等队友回话'),
+    ('web_search', '上网查资料'),
+    ('web_fetch', '读网页'),
+    ('subagent', '派子任务'),
+    ('workflow', '跑工作流'),
+    ('skill', '调用技能'),
+    ('present', '整理交付物'),
+    ('job_', '跑后台任务'),
+    ('glob', '翻文件目录'),
+    ('grep', '搜代码'),
+    ('edit', '改代码'),
+    ('write', '写文件'),
+    ('read', '读文件'),
+    ('pwsh', '跑命令'),
+    ('bash', '跑命令'),
+)
 _SUMMARY_WORDS = (
     ('applications', '帮你操作软件'),
     ('computer', '帮你操作电脑画面'),
@@ -36,6 +68,44 @@ _TERMINAL_WORDS = {
 }
 
 
+
+def _mmss(seconds):
+    total = max(0, int(seconds or 0))
+    if total < 60:
+        return '%d 秒' % total
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return '%d 分' % minutes + (' %d 秒' % sec if sec else '')
+    hours, minutes = divmod(minutes, 60)
+    return '%d 小时 %d 分' % (hours, minutes)
+
+
+def _mostly_latin(text):
+    """DSH 的英文思考不该被原样念出来；判断这段是不是「英文为主的原文」。"""
+    letters = [c for c in str(text or '') if c.isalpha()]
+    if not letters:
+        return False
+    cjk = sum(1 for c in letters if '\u4e00' <= c <= '\u9fff')
+    return cjk / len(letters) < 0.2
+
+
+def _activity(row):
+    """这一轮具体卡在哪个动作上，用中文短词说，供报时句式复用。"""
+    probe = (str(row.get('tool') or '') + ' ' + str(row.get('summary') or '')).lower()
+    for key, words in _SUMMARY_WORDS:
+        if key in probe:
+            return words
+    tool = str(row.get('tool') or '').lower()
+    if tool:
+        for key, words in _DSH_TOOL_WORDS:
+            if key in tool:
+                return words
+    for key, words in _ACTION_WORDS:
+        if key in probe:
+            return words
+    return '帮你干活'
+
+
 def _goal_hint(row):
     """从 DSH 目标里取一段真正说人话的任务提示（跳过运行时噪声）。"""
     goal = str(row.get('goal') or '').replace('\n', ' ').strip()
@@ -46,7 +116,7 @@ def _goal_hint(row):
     return goal
 
 
-def _plain_progress(row):
+def _plain_progress(row, elapsed=0):
     """把 DSH 的结构化事实翻成咕嘎的大白话，去掉会话编号和日志腔。"""
     summary = str(row.get('summary') or '').strip()
     tool = str(row.get('tool') or '').strip()
@@ -55,22 +125,26 @@ def _plain_progress(row):
     if state in _TERMINAL_WORDS:
         return _TERMINAL_WORDS[state]
     hint = _goal_hint(row)
-    tail = '，你说的「' + hint + '」我记着呢' if hint else ''
+    tail = '；你说的「' + hint + '」我记着呢' if hint else ''
+    spent = ('，已经跑了 ' + _mmss(elapsed)) if elapsed else ''
     marker = 'DSH 的公开答复：'
     if summary.startswith(marker):
         body = summary[len(marker):].replace('\n', ' ').strip()
-        if body:
+        # DSH 的公开答复常常是英文过程话（"I'll start by..."），原样念给主人听很傻。
+        if body and not _mostly_latin(body):
             return body[:160]
     last_answer = str(row.get('last_answer') or '').strip()
+    if _mostly_latin(last_answer):
+        last_answer = ''
     probe = (tool + ' ' + summary).lower()
     for key, words in _SUMMARY_WORDS:
         if key in probe:
             if last_answer:
-                return last_answer[:150]
-            return _OPENERS[(step or 0) % len(_OPENERS)] + '我正在' + words + '呢，我盯着呢，有结果马上告诉你～' + tail
+                return last_answer[:150] + spent
+            return _OPENERS[(step or 0) % len(_OPENERS)] + '我正在' + words + '呢' + spent + '，有结果马上告诉你～' + tail
     if last_answer:
-        return last_answer[:150]
-    return '主人～我还在帮你干活呢，我会一直盯着，弄好了第一时间跟你说～' + tail
+        return last_answer[:150] + spent
+    return '主人～我还在帮你干活呢' + spent + '，弄好了第一时间跟你说～' + tail
 
 
 class DshLink(QObject):
@@ -79,7 +153,9 @@ class DshLink(QObject):
         self.panel=panel;self.clock=clock or time.monotonic
         self.sessions=OrderedDict();self.focused_session=None
         self.interval=max(15,int(interval));self.last_notice=0;self.event_count=0
-        self.host_seen=None
+        # 主人要求每分钟组织一次自然语言进度；留成实例属性方便按需调整/测试。
+        self.narrate_seconds=_NARRATE_SECONDS
+        self.host_seen=None;self.last_spoken_text=''
         self.timer=QTimer(self);self.timer.setInterval(1000);self.timer.timeout.connect(self.tick);self.timer.start()
 
     def receive(self,args):
@@ -109,9 +185,10 @@ class DshLink(QObject):
         if state:value['state']=state
         if old.get('event_id')==value.get('event_id') and old:return dict(ok=True,duplicate=True)
         value.setdefault('state','running')
+        value.setdefault('first_seen',now)
         self.sessions[session]=value;self.sessions.move_to_end(session)
         while len(self.sessions)>16:self.sessions.popitem(last=False)
-        if self.focused_session is None or (value['kind']=='user/message' and not value.get('parent_session_id')):self.focused_session=session
+        self._focus(session,value)
         self.event_count+=1
         if self.focused_session==session:
             voice=getattr(self.panel,'voice',None)
@@ -119,6 +196,10 @@ class DshLink(QObject):
                 voice.set_task_context(dict(running=value['state']=='running',kind='external_dsh',goal=value.get('goal',''),summary=value.get('summary','')))
         if value.get('state') in ('finished','failed','cancelled','waiting') and old.get('state')!=value.get('state'):
             value['terminal_pending']=True
+            value['terminal_since']=now
+        # 当次任务真的跑完了：先验收实际情况，再组织「下一步」，不靠模型自述。
+        if value.get('state')=='finished':
+            self._start_review(value)
         try:
             if self.focused_session==session:
                 from core.super_agent.screen_context import start_watching,stop_watching
@@ -147,6 +228,120 @@ class DshLink(QObject):
         if not row or row.get('state')!='running' or self.clock()-row['updated_at']>=45:return None
         return dict(running=True,kind='external_dsh',goal=row.get('goal',''),summary=row.get('summary',''))
 
+    def _owned(self):
+        try:
+            from core.super_agent.dsh_gateway import owned_sessions
+            return owned_sessions()
+        except Exception:
+            return set()
+
+    def _focus(self, session, value):
+        """只盯咕嘎自己拉起的那个对话；没有归属信息时优先盯主会话，不盯别人的子会话。"""
+        owned = self._owned()
+        if owned and session in owned:
+            self.focused_session = session
+            return
+        # 归属会话如果已经不在我们跟踪的列表里（被关掉/早就结束），不能因此永久闭嘴；
+        # 只有在「确实还有一个归属会话在跟踪中」时，才不抢别人的会话。
+        if owned and (owned & set(self.sessions.keys())):
+            return
+        child = bool(value.get('parent_session_id'))
+        if self.focused_session is None:
+            if not child:
+                self.focused_session = session
+                self._focus_is_child = False
+            else:
+                # 只看到子会话时先盯着，等主会话出现再换过去。
+                self.focused_session = session
+                self._focus_is_child = True
+            return
+        # 当前盯的是子会话，而主会话出现了：换成主会话。
+        if getattr(self, '_focus_is_child', False) and not child:
+            self.focused_session = session
+            self._focus_is_child = False
+
+    def _report_text(self, row, now):
+        """返回这一拍要不要说话、说什么；返回空串就保持安静。
+
+        节奏（主人 2026-11-11 指定）：
+        1) 任务结束 → 立刻报终态；随后再报一条「验收结论 + 下一步」。
+        2) 运行中 → **每 60 秒**组织一次自然语言进度，不多不少。
+        3) 连接断了 → 只说一次「暂时听不到」，绝不谎称结束。
+        """
+        if row.get('terminal_pending'):
+            # 正常跑完：先等「验收 + 下一步」，把结论和下一步合成一条说，不连发两条。
+            if str(row.get('state') or '') == 'finished':
+                result = row.get('review_result')
+                if result:
+                    row['terminal_pending'] = False
+                    row['review_spoken'] = True
+                    return str(result.get('next_step') or '') or _TERMINAL_WORDS['finished']
+                if now - row.get('terminal_since', now) < 10:
+                    return ''
+            row['terminal_pending'] = False
+            return _TERMINAL_WORDS.get(str(row.get('state') or ''), '')
+        # 验收结果比终态播报晚到：补一条，且只补一次。
+        result = row.get('review_result')
+        if result and not row.get('review_spoken'):
+            row['review_spoken'] = True
+            return str(result.get('next_step') or '')
+        if row.get('pending_report'):
+            # 到点了，模型那句还没组织好：再等一小会儿，超时就退回确定性文案。
+            elapsed = now - row.get('first_seen', now)
+            line = ''
+            try:
+                from core.super_agent import dsh_digest
+                line = dsh_digest.cached(dsh_digest.fingerprint(row, row.get('narrate_seq', 0)))
+            except Exception:
+                line = ''
+            if not line and now - row.get('pending_since', now) < _DIGEST_WAIT_SECONDS:
+                return ''
+            row['pending_report'] = False
+            return line or _plain_progress(row, elapsed)
+        # 固定 60 秒节拍：到点就发起一次「组织」，这一拍先不打扰。
+        if now - row.get('last_narrate_at', row.get('first_seen', now)) < self.narrate_seconds:
+            return ''
+        seq = int(row.get('narrate_seq') or 0) + 1
+        row['narrate_seq'] = seq
+        row['last_narrate_at'] = now
+        elapsed = int(now - row.get('first_seen', now))
+        line = ''
+        started = ''
+        try:
+            from core.super_agent import dsh_digest
+            started = dsh_digest.request_async(row, elapsed, variant=seq)
+            if not started:
+                line = dsh_digest.cached(dsh_digest.fingerprint(row, seq))
+        except Exception:
+            started = ''
+        if line:
+            return line
+        if not started:
+            # 模型通道关闭（测试/现场关闭超级智能体）：不白等 7 秒，直接用确定性文案。
+            return _plain_progress(row, elapsed)
+        row['pending_report'] = True
+        row['pending_since'] = now
+        return ''
+
+    def _start_review(self, row):
+        """任务结束后在后台跑一次「验收 + 下一步」，结果回填给主线程播报。"""
+        if row.get('review_started'):
+            return
+        row['review_started'] = True
+        snapshot = dict(row)
+
+        def work():
+            try:
+                from core.super_agent import finish_review
+                result = finish_review.review(snapshot)
+            except Exception as exc:  # noqa: BLE001
+                result = dict(ok=False, verdict='unverified', reasons=[type(exc).__name__],
+                              next_step='')
+            if result.get('next_step'):
+                row['review_result'] = result
+
+        threading.Thread(target=work, name='guga-finish-review', daemon=True).start()
+
     def tick(self):
         row=self.sessions.get(self.focused_session)
         if not row:return
@@ -157,7 +352,6 @@ class DshLink(QObject):
             if watcher.active and now-row.get('updated_at',now)>180:watcher.stop()
         except Exception:
             pass
-        if not row.get('terminal_pending') and (row.get('state')!='running' or now-self.last_notice<self.interval):return
         panel=self.panel
         allowed=getattr(panel,'companion_chat_allowed',None)
         if callable(allowed) and not allowed():return
@@ -172,12 +366,14 @@ class DshLink(QObject):
                 voice.set_task_context(dict(running=False,kind='external_dsh_unknown',goal=row.get('goal',''),summary='进度连接暂时中断，无法确定任务是否仍在执行；没有发出停止指令'))
         else:
             row.pop('stale_notified',None)
-            text=_plain_progress(row)
+            text=self._report_text(row,now)
+            if not text:return
             try:
                 from core.super_agent.narration import compose
                 text=compose(text,with_memory=True)
             except Exception:
                 pass
+            if text==self.last_spoken_text:return
         voice=getattr(panel,'voice',None)
         if getattr(panel,'voice_active',False) and voice:
             if not voice.notify_battleground('dsh-link-'+row.get('event_id',''),text,during_task=True):return
@@ -185,6 +381,7 @@ class DshLink(QObject):
             if hasattr(panel,'_show_active_bubble'):panel._show_active_bubble(text)
             panel._say_active_reply(text,'happy','none',speak=True,conversation_id=panel.active_id)
         row['terminal_pending']=False;row['last_spoken_goal']=row.get('goal');self.last_notice=now
+        self.last_spoken_text=text
         try:
             from core.super_agent.narration import log_report
             log_report(text,str(row.get('state') or ''))

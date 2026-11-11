@@ -24,19 +24,193 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import re
+import sqlite3
 import time
 import urllib.parse
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 HOST = '127.0.0.1'
 PORT = 3080
 COOKIE_TTL_SECONDS = 600.0
 
+# 咕嘎派出去的会话必须落在「完全权限」档：
+# 该 preset = {sandbox: danger-full-access, approval: never}。
+# 否则默认 workspace-write + approval:ask —— 任务一碰工作区外的文件就会停下来等人点同意，
+# 而咕嘎这条链路本来就不该有人在场。DSH 的 session/create 没有权限参数，
+# 所以建完立刻用 commands/execute 执行 `/permission <preset>`（不经过模型回合）。
+PERMISSION_PRESET = 'danger-full-access'
+
 
 class GatewayError(RuntimeError):
     pass
+
+
+# 只有「咕嘎亲自投递过指令」的会话才算它这一轮要盯的会话；
+# 其余在跑的会话（主人的、其他队友的）与它无关，不该抢播报。
+#
+# 归属落盘（契约第 5 节）：进程内 list/dict 仍是快路径，SQLite 是重启后的真相来源。
+# 没有落盘时，咕嘎一重启就忘了「哪些会话是我派出去的」，既接不回来也守不住播报边界。
+_OWNED = []
+_OWNED_LIMIT = 16
+_OWNERS = {}
+_OWNED_LOADED = False       # 本进程是否已从盘里播种过内存缓存
+_PREPARED = set()           # 已建过 owned_sessions 表的库文件（绝对路径）
+_LAST_STORE_ERROR = ''      # 最近一次落盘失败原因；仅诊断用，不含凭据
+
+TASKS_DB = Path(__file__).resolve().parents[2]/'runtime/personal-harness/tasks.sqlite3'
+
+
+def _store_path(store=None) -> Path:
+    """store 允许三种形态：None=默认库、路径、带 .path 的 PersonalHarness 实例。"""
+    if store is None:
+        override = os.environ.get('GUGA_TASKS_DB', '').strip()
+        return Path(override) if override else TASKS_DB
+    path = getattr(store, 'path', None)
+    return Path(path if path is not None else store)
+
+
+@contextmanager
+def _db(store=None):
+    path = _store_path(store)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(path), timeout=5)
+    db.row_factory = sqlite3.Row
+    try:
+        key = str(path.resolve())
+        if key not in _PREPARED:
+            with db:
+                db.execute('CREATE TABLE IF NOT EXISTS owned_sessions ('
+                           'session_id TEXT PRIMARY KEY, conversation_id TEXT, '
+                           'bound_at REAL, source TEXT)')
+            _PREPARED.add(key)
+        yield db
+    finally:
+        db.close()
+
+
+def _note_error(exc) -> None:
+    global _LAST_STORE_ERROR
+    _LAST_STORE_ERROR = _no_secret(str(exc))[:200]
+
+
+def _upsert(session_id: str, conversation_id, source: str, store=None) -> bool:
+    """写穿到 SQLite。写失败只记诊断，不打断内存快路径——一次磁盘故障不该让投递失败。"""
+    try:
+        with _db(store) as db, db:
+            db.execute(
+                'INSERT INTO owned_sessions(session_id, conversation_id, bound_at, source) '
+                'VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET '
+                'conversation_id=COALESCE(excluded.conversation_id, owned_sessions.conversation_id), '
+                'bound_at=excluded.bound_at, source=excluded.source',
+                (session_id, conversation_id, time.time(), source))
+        return True
+    except (sqlite3.Error, OSError) as exc:
+        _note_error(exc)
+        return False
+
+
+def _load_once(store=None) -> None:
+    """本进程第一次读归属时从盘里播种最近 N 条；之后读全走内存。"""
+    global _OWNED_LOADED
+    if _OWNED_LOADED:
+        return
+    _OWNED_LOADED = True
+    try:
+        with _db(store) as db:
+            rows = db.execute('SELECT session_id, conversation_id FROM owned_sessions '
+                              'ORDER BY bound_at DESC LIMIT ?', (_OWNED_LIMIT,)).fetchall()
+    except (sqlite3.Error, OSError) as exc:
+        _note_error(exc)
+        return
+    for row in reversed(rows):      # 旧→新，保持 _OWNED 尾部最新的语义
+        sid = str(row['session_id'] or '').strip()
+        if not sid:
+            continue
+        if sid in _OWNED:
+            _OWNED.remove(sid)
+        _OWNED.append(sid)
+        conversation_id = str(row['conversation_id'] or '').strip()
+        if conversation_id:
+            _OWNERS.setdefault(sid, conversation_id)
+    while len(_OWNED) > _OWNED_LIMIT:      # 先写后读时内存里已有条目，保持上限不破
+        _OWNED.pop(0)
+    while len(_OWNERS) > _OWNED_LIMIT:
+        _OWNERS.pop(next(iter(_OWNERS)))
+
+
+def remember_owned(session_id: str, store=None) -> None:
+    sid = str(session_id or '').strip()
+    if not sid:
+        return
+    if sid in _OWNED:
+        _OWNED.remove(sid)
+    _OWNED.append(sid)
+    while len(_OWNED) > _OWNED_LIMIT:
+        _OWNED.pop(0)
+    _upsert(sid, None, 'owned', store)
+
+
+def owned_sessions(store=None) -> set:
+    _load_once(store)
+    return set(_OWNED)
+
+
+# 咕嘎自己的对话 ↔ DSH 会话 的归属映射（用于"只盯自己拉起的那个对话"和事后验收取证）。
+def remember_owner(session_id: str, conversation_id: str, store=None) -> None:
+    session_id = str(session_id or '').strip()
+    conversation_id = str(conversation_id or '').strip()
+    if not session_id or not conversation_id:
+        return
+    _OWNERS[session_id] = conversation_id
+    while len(_OWNERS) > _OWNED_LIMIT:
+        _OWNERS.pop(next(iter(_OWNERS)))
+    _upsert(session_id, conversation_id, 'owner', store)
+
+
+def owner_of(session_id: str, store=None) -> str:
+    sid = str(session_id or '').strip()
+    if not sid:
+        return ''
+    _load_once(store)
+    value = _OWNERS.get(sid, '')
+    if value:
+        return value
+    # 内存没有就查一次盘（别的进程写过，或调用方清过内存缓存）。
+    try:
+        with _db(store) as db:
+            row = db.execute('SELECT conversation_id FROM owned_sessions WHERE session_id=?',
+                             (sid,)).fetchone()
+    except (sqlite3.Error, OSError) as exc:
+        _note_error(exc)
+        return ''
+    value = str((row['conversation_id'] if row else '') or '').strip()
+    if value:
+        _OWNERS[sid] = value
+    return value
+
+
+def forget_owned(session_id: str, store=None) -> None:
+    """显式撤销归属（会话被关掉/不再由咕嘎负责）：内存与盘一起删。"""
+    sid = str(session_id or '').strip()
+    if not sid:
+        return
+    if sid in _OWNED:
+        _OWNED.remove(sid)
+    _OWNERS.pop(sid, None)
+    try:
+        with _db(store) as db, db:
+            db.execute('DELETE FROM owned_sessions WHERE session_id=?', (sid,))
+    except (sqlite3.Error, OSError) as exc:
+        _note_error(exc)
+
+
+def owned_store_error() -> str:
+    """最近一次归属落盘失败的原因（空串=正常）；给诊断用，不含凭据。"""
+    return _LAST_STORE_ERROR
 
 
 def _no_secret(text: str) -> str:
@@ -232,7 +406,10 @@ class DshGateway:
             'content': [{'type': 'text', 'text': text}],
             'clientTimeZone': 'Asia/Shanghai',
         }
-        return self.rpc('session/prompt', {'request': request}, timeout=20.0)
+        result = self.rpc('session/prompt', {'request': request}, timeout=20.0)
+        # 投递成功才认领：这是咕嘎自己拉起的对话，后续只盯它。
+        remember_owned(resolved)
+        return result
 
     def resolve_session_id(self, session_id: str) -> str:
         """把任意形态（裸 uuid / session- 前缀 / 后缀）归一到列表里的原样 id。"""
@@ -246,6 +423,82 @@ class DshGateway:
         if not exact and wanted in {str(item.get('sessionId') or '') for item in items}:
             return wanted
         raise GatewayError('目标会话不在 DSH 会话列表里，拒绝投递：' + wanted[:80])
+
+    # ------------------------------------------------------------------ 开新对话
+    def create_session(self, conversation_id: str = '', preset: str = '') -> dict:
+        """新建一个空会话，返回真实 sessionId，并登记为「咕嘎自己拉起的对话」。
+
+        走的是 3080 同一个内部 RPC 面（`session/create`，实测可用）。
+        不返回会话编号就报错，绝不假装已经建好。
+        """
+        request = {'clientTimeZone': 'Asia/Shanghai'}
+        if preset:
+            request['agentPreset'] = str(preset)[:80]
+        result = self.rpc('session/create', {'request': request}, timeout=20.0)
+        result = result if isinstance(result, dict) else {}
+        session_id = str(result.get('sessionId') or result.get('session_id') or '').strip()
+        if not session_id:
+            raise GatewayError('DSH 受理了新建会话但没有返回会话编号；不假装已经建好')
+        remember_owned(session_id)
+        if conversation_id:
+            remember_owner(session_id, conversation_id)
+        # 立刻切到完全权限并复核。不切的话默认是 workspace-write + approval:ask，
+        # 任务一碰工作区外的文件就会停下来等人点同意——那正是咕嘎最不该发生的事。
+        permission = self.ensure_full_access(session_id)
+        return dict(ok=True, session_id=session_id,
+                    agent_preset=str(result.get('agentPreset') or ''),
+                    conversation_id=str(conversation_id or ''),
+                    permission=permission,
+                    full_access=bool(permission.get('ok')))
+
+    # ------------------------------------------------------------------ 权限
+    def permission_of(self, session_id: str) -> dict:
+        """读会话当前权限档位（投影里的 `values.permissions.currentValue`）。"""
+        session_id = str(session_id or '').strip()
+        if not session_id:
+            return {}
+        raw = self.rpc('session/projections', {'request': {'sessionId': session_id}})
+        values = (raw or {}).get('values') or {}
+        permissions = values.get('permissions')
+        return permissions if isinstance(permissions, dict) else {}
+
+    def ensure_full_access(self, session_id: str) -> dict:
+        """把会话切到完全权限档，并**实测复核**。
+
+        返回 {ok, before, after, preset, error}。复核不一致就如实 ok=False——
+        权限没到位的话，任务迟早会卡在"等人点同意"上，那比直接报错更坑。
+        """
+        session_id = str(session_id or '').strip()
+        if not session_id:
+            return dict(ok=False, error='没有会话编号')
+        before = str((self.permission_of(session_id) or {}).get('currentValue') or '')
+        if before == PERMISSION_PRESET:
+            return dict(ok=True, before=before, after=before, preset=PERMISSION_PRESET, already=True)
+        try:
+            self.rpc('commands/execute', {
+                'agentId': session_id,
+                'line': '/permission ' + PERMISSION_PRESET,
+                'submittedAttachments': [],
+            }, timeout=20.0)
+        except Exception as exc:  # noqa: BLE001
+            return dict(ok=False, before=before, after='', preset=PERMISSION_PRESET,
+                        error='切换权限失败：' + _no_secret(str(exc))[:200])
+        after = str((self.permission_of(session_id) or {}).get('currentValue') or '')
+        ok = after == PERMISSION_PRESET
+        return dict(ok=ok, before=before, after=after, preset=PERMISSION_PRESET,
+                    error='' if ok else '权限切换后复核不一致')
+
+    def start_task(self, text: str, conversation_id: str = '', mode: str = 'queue') -> dict:
+        """开一个新对话并立刻投第一条指令——咕嘎托管 DSH 的最小闭环。"""
+        created = self.create_session(conversation_id=conversation_id)
+        session_id = created['session_id']
+        try:
+            self.prompt(session_id, text, mode=mode)
+        except Exception as exc:  # noqa: BLE001
+            # 会话建了但指令没进去：如实报告并带回会话编号，方便人工收尾；不自动重投。
+            return dict(ok=False, session_id=session_id, accepted=False,
+                        error='新会话已建立，但第一条指令没有投递成功：' + _no_secret(str(exc))[:200])
+        return dict(ok=True, session_id=session_id, accepted=True)
 
     # ------------------------------------------------------------------ 健康
     def health(self) -> dict:

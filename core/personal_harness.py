@@ -13,6 +13,20 @@ from core.agent_memory import safe_text
 ROOT = Path(__file__).resolve().parents[1]
 _RECOVERED=set()
 
+# 老库升级用：逐列补齐，已在的列跳过。顺序固定，重复执行结果一致。
+TICKET_MIGRATIONS = (
+    ('partition', 'TEXT'),
+    ('dsh_session', 'TEXT'),
+    ('attempts', 'INTEGER DEFAULT 0'),
+    ('max_attempts', 'INTEGER DEFAULT 3'),
+    ('verdict', 'TEXT'),
+    ('acceptance_id', 'TEXT'),
+    ('parent_ticket', 'TEXT'),
+    ('last_error', 'TEXT'),
+)
+# 重启后仍可续跑的票据状态（契约第 4 节）。
+RESUME_STATES = ('running', 'interrupted', 'awaiting_review', 'rework')
+
 
 class PersonalHarness:
     def __init__(self, path=None):
@@ -23,7 +37,10 @@ class PersonalHarness:
                 CREATE TABLE IF NOT EXISTS tickets (
                     id TEXT PRIMARY KEY, agent TEXT, conversation TEXT, goal TEXT,
                     cwd TEXT, session TEXT, state TEXT, summary TEXT,
-                    evidence TEXT NOT NULL DEFAULT '[]', created REAL, updated REAL);
+                    evidence TEXT NOT NULL DEFAULT '[]', created REAL, updated REAL,
+                    partition TEXT, dsh_session TEXT, attempts INTEGER DEFAULT 0,
+                    max_attempts INTEGER DEFAULT 3, verdict TEXT, acceptance_id TEXT,
+                    parent_ticket TEXT, last_error TEXT);
                 CREATE TABLE IF NOT EXISTS receipts (
                     id INTEGER PRIMARY KEY, ticket TEXT, tool TEXT, action TEXT,
                     ok INTEGER, summary TEXT, created REAL);
@@ -33,6 +50,23 @@ class PersonalHarness:
                 CREATE TABLE IF NOT EXISTS inputs (
                     id INTEGER PRIMARY KEY, ticket TEXT, content TEXT, delivered INTEGER DEFAULT 0);
             ''')
+            self._migrate(db)
+
+    def _migrate(self, db):
+        """把老库的 tickets 补到当前列集合；已经是最新结构时什么也不做。"""
+        existing = {row[1] for row in db.execute('PRAGMA table_info(tickets)')}
+        for name, ddl in TICKET_MIGRATIONS:
+            if name in existing:
+                continue
+            try:
+                db.execute('ALTER TABLE tickets ADD COLUMN %s %s' % (name, ddl))
+            except sqlite3.OperationalError as exc:
+                # 两个进程同时升级同一老库时，另一侧可能刚加过这一列。
+                if 'duplicate column' not in str(exc).lower():
+                    raise
+        # ALTER 出来的新列在老行上是 NULL；这两列会参与拼路径/比较，'' 才是"没有"的语义。
+        db.execute("UPDATE tickets SET partition='' WHERE partition IS NULL")
+        db.execute("UPDATE tickets SET parent_ticket='' WHERE parent_ticket IS NULL")
 
     @contextmanager
     def connect(self):
@@ -56,13 +90,17 @@ class PersonalHarness:
         count=self.recover();_RECOVERED.add(key)
         return count
 
-    def create(self, agent, conversation, goal, cwd):
+    def create(self, agent, conversation, goal, cwd, partition='', parent=''):
         ident = uuid.uuid4().hex
         now = time.time()
         with self.connect() as db:
-            db.execute('INSERT INTO tickets VALUES (?,?,?,?,?,?,?, ?,?,?,?)',
+            # 显式列名：新增列不会因为位置变化把 INSERT 挤坏（老版本是 VALUES 全位置）。
+            db.execute('INSERT INTO tickets (id,agent,conversation,goal,cwd,session,state,'
+                       'summary,evidence,created,updated,partition,parent_ticket) '
+                       'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        (ident, str(agent), str(conversation), safe_text(goal), str(cwd), None,
-                        'running', 'DSH 正在启动，尚未完成任务', '[]', now, now))
+                        'running', 'DSH 正在启动，尚未完成任务', '[]', now, now,
+                        str(partition or ''), str(parent or '')))
         return self.get(ident)
 
     def get(self, ident):
@@ -75,7 +113,9 @@ class PersonalHarness:
         return data
 
     def update(self, ident, **values):
-        allowed = {'session', 'state', 'summary', 'evidence'}
+        allowed = {'session', 'state', 'summary', 'evidence', 'partition', 'dsh_session',
+                   'attempts', 'max_attempts', 'verdict', 'acceptance_id', 'parent_ticket',
+                   'last_error'}
         if not values or set(values)-allowed:
             raise ValueError('任务更新字段无效')
         values = dict(values)
@@ -88,6 +128,76 @@ class PersonalHarness:
             db.execute('UPDATE tickets SET '+','.join(k+'=?' for k in values)+' WHERE id=?',
                        (*values.values(), ident))
         return self.get(ident)
+
+    # ------------------------------------------------ 任务编号 / 分区 / 返工 / 验收
+    # 下面这些方法都只动 tickets 表，且只更新明确列；不改变旧调用方的语义。
+    def _write(self, ident, **values):
+        values = dict(values)
+        values['updated'] = time.time()
+        with self.connect() as db:
+            changed = db.execute('UPDATE tickets SET '+','.join(k+'=?' for k in values)+' WHERE id=?',
+                                 (*values.values(), ident)).rowcount
+        if not changed:
+            raise ValueError('任务不存在')
+        return self.get(ident)
+
+    def bind_dsh(self, ident, session_id):
+        """把票据钉到它专属的 DSH 会话：返工必须回到同一个 session。"""
+        return self._write(ident, dsh_session=str(session_id or '').strip())
+
+    def set_partition(self, ident, partition):
+        """分区（如 guga）：决定工作区目录与归属，不参与执行判定。"""
+        return self._write(ident, partition=str(partition or '').strip())
+
+    def link_acceptance(self, ident, acceptance_id, verdict=''):
+        """关联独立验收台账；verdict 由验收侧给（pass/fail/unverified）。"""
+        values = {'acceptance_id': str(acceptance_id or '').strip()}
+        if verdict:
+            values['verdict'] = str(verdict)
+        return self._write(ident, **values)
+
+    def attempt(self, ident, max_attempts=None):
+        """记一次返工尝试。返回 {attempts, max_attempts, exhausted}；不在这里改 state。"""
+        limit = None if max_attempts is None else max(1, int(max_attempts))
+        with self.connect() as db:
+            changed = db.execute(
+                'UPDATE tickets SET attempts=COALESCE(attempts,0)+1, '
+                'max_attempts=COALESCE(?, max_attempts, 3), updated=? WHERE id=?',
+                (limit, time.time(), ident)).rowcount
+            if not changed:
+                raise ValueError('任务不存在')
+            row = db.execute('SELECT attempts, max_attempts FROM tickets WHERE id=?',
+                             (ident,)).fetchone()
+        attempts = int(row['attempts'] or 0)
+        cap = int(row['max_attempts'] or 3)
+        return dict(attempts=attempts, max_attempts=cap, exhausted=attempts >= cap)
+
+    def resume_candidates(self, agent, limit=10):
+        """重启后可续跑的票据：state in (running, interrupted, awaiting_review, rework)。"""
+        marks = ','.join('?' for _ in RESUME_STATES)
+        with self.connect() as db:
+            rows = db.execute('SELECT * FROM tickets WHERE agent=? AND state IN ('+marks+') '
+                              'ORDER BY updated DESC LIMIT ?',
+                              (str(agent), *RESUME_STATES,
+                               max(1, min(50, int(limit))))).fetchall()
+        return [dict(row) for row in rows]
+
+    def by_session(self, session_id):
+        """按 DSH 会话编号反查票据（重启后靠它把会话接回任务编号）。"""
+        wanted = str(session_id or '').strip()
+        if not wanted:
+            return None
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM tickets WHERE dsh_session=? OR session=? '
+                             'ORDER BY updated DESC LIMIT 1', (wanted, wanted)).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        try:
+            data['evidence'] = json.loads(data['evidence'])
+        except (TypeError, ValueError):
+            pass
+        return data
 
     def recent(self, agent, conversation=None, limit=8):
         with self.connect() as db:
