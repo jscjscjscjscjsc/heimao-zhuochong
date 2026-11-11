@@ -80,7 +80,11 @@ def build(panel):
     p.effort_combo=QComboBox()
     for label,value in (('快速 · 不思考','quick'),('思考 · 轻度','low'),('思考 · 高','high'),('思考 · 极限','max')):p.effort_combo.addItem(label,value)
     p.effort_combo.setToolTip('仅控制普通问答和截图回答；执行任务保留独立策略')
-    for combo,key,default in ((p.route_combo,'chat/route','auto'),(p.effort_combo,'chat/effort','quick')):
+    p.search_combo=QComboBox()
+    for label,value in (('联网 · 自动','auto'),('联网 · 强制','always'),('联网 · 关闭','never')):
+        p.search_combo.addItem(label,value)
+    p.search_combo.setToolTip('自动：只有时效/事实类问题才联网；强制：本轮一定联网；关闭：不联网')
+    for combo,key,default in ((p.route_combo,'chat/route','auto'),(p.effort_combo,'chat/effort','quick'),(p.search_combo,'chat/search','auto')):
         combo.setCurrentIndex(max(0,combo.findData(p.pet._config._s.value(key,default))))
         combo.currentIndexChanged.connect(lambda index,c=combo,k=key:p.pet._config._s.setValue(k,c.currentData()))
         options.addWidget(combo)

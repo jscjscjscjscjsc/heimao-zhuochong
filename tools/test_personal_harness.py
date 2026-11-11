@@ -416,7 +416,10 @@ class IntegrationTests(unittest.TestCase):
         from core.task_speech import TaskSpeechQueue
         p=self.panel;old=p.voice;p._task_speech=TaskSpeechQueue()
         from types import SimpleNamespace
-        notify=Mock();p.voice=SimpleNamespace(is_speaking=False,notify_battleground=notify,set_task_context=Mock());p.voice_active=True
+        # 这条测的是「通话中走实时语音通道」。_flush_task_speech 用 voice.connected 判断是否
+        # 真的在通话里；假 voice 不给 connected=True 就永远走本机朗读，测不到本意。
+        notify=Mock();p.voice=SimpleNamespace(is_speaking=False,connected=True,
+            notify_battleground=notify,set_task_context=Mock());p.voice_active=True
         try:
             with patch.object(p.pet._tts,'speak') as edge:
                 p._dsh_event(dict(type='dsh_event',job_id='voice-proof',conversation_id=p.active_id,

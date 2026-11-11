@@ -32,13 +32,29 @@ def web_fact_from_tool_event(event):
     return dict(tool=str(ego.get('tool') or event.get('tool') or '')[:60],
                 url=url,title=title,ok=ego.get('ok'),at=time.time())
 
+def short_bubble_text(text,limit=260):
+    """Bubbles stay short and plain; rich text belongs to the chat window."""
+    from core.companion_dialogue import speech_answer
+    value=speech_answer(str(text or '')).strip()
+    if len(value)>limit:return value[:limit].rstrip()+'…'
+    return value
+
+
+def search_mode_of(panel):
+    """Read the shell's 联网 switch without assuming every test double has one."""
+    combo=getattr(panel,'search_combo',None)
+    try:return (combo.currentData() or 'auto') if combo is not None else 'auto'
+    except Exception:return 'auto'
+
+
 from PyQt5.QtCore import Qt, QEvent, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QPixmap
 from PyQt5.QtWidgets import (QDialog, QFrame, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QTreeWidget, QTreeWidgetItem, QTextBrowser, QPlainTextEdit, QInputDialog, QMenu,
-    QSplitter, QCheckBox, QMessageBox)
+    QSplitter, QCheckBox, QMessageBox, QApplication)
 
 from core.chat_workspace import ChatWorkspace
+from core.chat_render import render_markdown
 from core.self_agent import SelfAgent, ToolBridge
 from core.realtime_agent import AgentRealtimeVoice
 from core.task_control import TaskControlGate
@@ -123,6 +139,8 @@ class AgentChatWindow(QDialog):
         self._task_heartbeat_timer.setInterval(1000)
         self._task_heartbeat_timer.timeout.connect(self._task_heartbeat)
         self.logs_visible = False
+        self._copy_store = {}
+        self._render_cache = {}
         self._pending_image = None
         self._screen_answers_inflight={}
         self.screen_answer_ready.connect(self._deliver_screen_answer)
@@ -143,6 +161,11 @@ class AgentChatWindow(QDialog):
         ids = [c['id'] for c in self.store.snapshot(agent_id=self.active_agent_id)['conversations']]
         self.open_conversation(saved if saved in ids else (ids[0] if ids else self.store.create_conversation(agent_id=self.active_agent_id)))
         self.proactive.start()
+        try:
+            from core.reflex import start_foreground_tracker
+            start_foreground_tracker()
+        except Exception:
+            pass
 
     def _pin(self, enabled):
         self.setWindowFlag(Qt.WindowStaysOnTopHint, enabled)
@@ -242,6 +265,20 @@ class AgentChatWindow(QDialog):
         self.refresh_tree()
         self.render()
 
+    def _rich_message(self,key,content):
+        """One message -> Qt rich HTML, cached by (key, content)."""
+        content=str(content or '')
+        hit=self._render_cache.get(key)
+        if hit and hit[0]==content:return hit[1],hit[2]
+        codes=[]
+        def register(source):
+            codes.append(source)
+            return 'guga-copy:%s:%d'%(key,len(codes)-1)
+        rendered=render_markdown(content,register)
+        if len(self._render_cache)>120:self._render_cache.clear()
+        self._render_cache[key]=(content,rendered,codes)
+        return rendered,codes
+
     def render(self):
         from core.chat_presentation import is_progress_ack
         messages = self.store.messages(self.active_id)
@@ -257,21 +294,46 @@ class AgentChatWindow(QDialog):
                 '<p style="color:#9aa1ae;font-size:12px;line-height:1.9">问个问题，或者交给我一件小事。<br>也可以截图提问、随时开始语音。</p></div>')
             return
         parts=[]
+        self._copy_store={}
         for m in visible:
             role=m['role'];is_user=role=='user';detail=m in hidden
-            text=html.escape(m['content']).replace('\n','<br>')
-            if detail:
-                key=str(m['id'])
-                summary=html.escape(m['content'].split('\n',1)[0])
-                text=(summary+f'　<a href="guga-log:{key}">收起</a><br>'+text) if key in self.expanded_logs else (summary+f'　<a href="guga-log:{key}">展开</a>')
             color='#edf2ff' if is_user else ('#f6f7f9' if detail else '#ffffff')
             who='你' if is_user else ('执行记录' if detail else self.active_profile['display_name'])
             pad='12' if not detail else '8'
-            content=f'<td bgcolor="{color}" style="padding:{pad}px;color:#303540"><span style="font-size:10px;color:#9aa1ad">{who}</span><br><p style="line-height:1.65;font-size:13px">{text}</p></td>'
+            footer=''
+            if detail:
+                key=str(m['id'])
+                summary=html.escape(m['content'].split('\n',1)[0])
+                if key in self.expanded_logs:
+                    body=('<p style="line-height:1.65;font-size:13px">'+summary+
+                          f'　<a href="guga-log:{key}">收起</a><br>'+
+                          html.escape(m['content']).replace('\n','<br>')+'</p>')
+                else:
+                    body=('<p style="line-height:1.65;font-size:13px">'+summary+
+                          f'　<a href="guga-log:{key}">展开</a></p>')
+            elif is_user:
+                body=('<p style="line-height:1.65;font-size:13px">'+
+                      html.escape(m['content']).replace('\n','<br>')+'</p>')
+            else:
+                key=str(m['id'])
+                body,codes=self._rich_message(key,m['content'])
+                self._copy_store[key]=dict(codes=codes,text=m['content'])
+                footer=('　<span style="font-size:10px;color:#b3b8c2">'
+                        '<a href="guga-copy-msg:%s" style="color:#8f959e">复制</a></span>'%html.escape(key))
+            content=f'<td bgcolor="{color}" style="padding:{pad}px;color:#303540"><span style="font-size:10px;color:#9aa1ad">{html.escape(str(who))}</span><br>{body}{footer}</td>'
             blank='<td width="30"></td>'
             parts.append('<table width="100%" cellspacing="0" cellpadding="0" style="margin-top:12px"><tr>'+ (blank+content if is_user else content+blank)+'</tr></table>')
         self.view.setHtml(''.join(parts))
-        self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
+        self.scroll_to_bottom()
+
+    def scroll_to_bottom(self):
+        """滚到底。setHtml 之后布局还没算完，立刻读 maximum() 得到的是旧值，
+        表现就是"每发一条就跳回最上面"——所以要等事件循环把布局跑完再滚一次。"""
+        bar = self.view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+        QTimer.singleShot(40, lambda: bar.setValue(bar.maximum()))
+        QTimer.singleShot(160, lambda: bar.setValue(bar.maximum()))
 
     def _toggle_logs(self,on):
         self.logs_visible=bool(on);self.render()
@@ -298,7 +360,26 @@ class AgentChatWindow(QDialog):
         QMessageBox.information(self,'快捷操作','在支持读取文字选区的软件里选中文字，鼠标旁出现「解释 / 截图分析」。\nCtrl+Alt+A 或「截图」：截取当前屏幕并直接发给模型。\nCtrl+Alt+E：直接解释当前选词。\n更多菜单保留框选截图和框选识字。\n临时解释不加入聊天记录，右下角可调整对话窗大小。'+('\n快捷键已被其他软件占用：'+', '.join(failed)+'；可使用窗口按钮。' if failed else ''))
 
     def _log_link(self, url):
-        if url.scheme() == 'guga-log':
+        scheme=url.scheme()
+        if scheme=='guga-copy':
+            key,_,index=url.path().rpartition(':')
+            entry=self._copy_store.get(key) or {}
+            codes=entry.get('codes') or []
+            try:code=codes[int(index)]
+            except Exception:code=''
+            if code:
+                QApplication.clipboard().setText(code)
+                self.status.setText('已复制 %d 行代码到剪贴板'%len(code.splitlines()))
+            else:
+                self.status.setText('这段代码已经不在，请重新生成回答')
+            return
+        if scheme=='guga-copy-msg':
+            text=str((self._copy_store.get(url.path()) or {}).get('text') or '')
+            if text:
+                QApplication.clipboard().setText(text)
+                self.status.setText('已复制这条回答')
+            return
+        if scheme=='guga-log':
             key = url.path()
             if key in self.expanded_logs:
                 self.expanded_logs.remove(key)
@@ -417,7 +498,7 @@ class AgentChatWindow(QDialog):
             facts.append(self.runtime.companion_memory.context(self.active_agent_id,'每日计划',self.active_id))
         return facts
 
-    def send(self, text=None, record_user=True, force_agent=False, execution_context=None, use_attachment=None,read_reply=False):
+    def send(self, text=None, record_user=True, force_agent=False, execution_context=None, use_attachment=None,read_reply=False,_skip_local=False):
         text = text if isinstance(text, str) else self.editor.toPlainText().strip()
         image=self._pending_image if (record_user if use_attachment is None else use_attachment) else None
         if image:
@@ -442,8 +523,20 @@ class AgentChatWindow(QDialog):
             self.pet._on_user_interaction()
             team=getattr(self.pet,'_multi_agent',None)
             if team:team.user_interaction(self.active_agent_id)
+        if not _skip_local and not force_agent and not image and not self.busy and not self._fast_inflight:
+            # Referent desktop actions ("点这块/往下滚/按回车") need no model at all.
+            # A non-unique target falls through to the normal model path instead.
+            try:
+                from core.reflex import match as match_reflex
+                reflex_command=match_reflex(text)
+            except Exception:
+                reflex_command=dict(matched=False)
+            if reflex_command.get('matched') and not reflex_command.get('need_model'):
+                self._reflex_command(reflex_command,record_user=record_user,read_reply=read_reply)
+                self.editor.clear();self.render()
+                return True
         from core.fast_commands import match
-        fast=match(text)
+        fast=dict(matched=False) if _skip_local else match(text)
         if fast.get('matched') and not force_agent and not image and (self.route_combo.currentData()!='chat' or fast.get('action') in ('daily_plan','dsh_link') or (execution_context or {}).get('_external_fast')):
             fast=dict(fast,_read_reply=bool(read_reply))
             if execution_context and execution_context.get('_receipt_id'):
@@ -512,7 +605,8 @@ class AgentChatWindow(QDialog):
             shared_image=shared_frame.get('_image_url') if shared_frame.get('ok') and shared_frame.get('frame_age_seconds',99)<=2 else None
             if not task:
                 self.answer.start(self.active_id,history,text,image_url=image or shared_image,effort=self.effort_combo.currentData(),read_aloud=read_reply,
-                    profile=self.active_profile,memory_context=memory_context,screen_context=shared_context)
+                    profile=self.active_profile,memory_context=memory_context,screen_context=shared_context,
+                    search_mode=search_mode_of(self))
             else:
                 handoff=dict(execution_context or {},_agent_id=self.active_agent_id,
                     _agent_profile=self.active_profile,_memory_context=memory_context,
@@ -575,7 +669,8 @@ class AgentChatWindow(QDialog):
         self._dialogue_context=context
         try:
             recalled=self._memory_context(text)
-            self.dialogue.start(self.active_id,self.store.messages(self.active_id,40),text,profile=self.active_profile,memory_context=recalled)
+            self.dialogue.start(self.active_id,self.store.messages(self.active_id,40),text,profile=self.active_profile,memory_context=recalled,
+                search_mode=search_mode_of(self))
             if not call_id:self._question_waiting(read_aloud)
             return True
         except Exception as exc:
@@ -597,7 +692,7 @@ class AgentChatWindow(QDialog):
             self._voice_readback=True
             voice.resolve_task(context['call_id'],dict(ok=bool(result.get('ok')),answer=speech_answer(text),error=result.get('error','')))
         if ident==self.active_id and agent_id==self.active_agent_id:
-            self._show_active_bubble(text);self.render()
+            self._show_active_bubble(short_bubble_text(text));self.render()
             if not self.voice_active and context['read_aloud']:
                 from core.agent_identity import voice_preferences
                 self.pet._tts.speak(speech_answer(text),voice_profile=voice_preferences(context['profile']))
@@ -704,7 +799,18 @@ class AgentChatWindow(QDialog):
         if self._run_kind=='answer' and self.busy and ident==self.active_id and generation==self.answer.generation:
             if text.strip() and not self._answer_text:
                 self.pet._multi_agent.work_state(self.active_agent_id,'idle','turn:'+ident)
-            self._answer_text=text;self.render()
+            self._answer_text=text
+            # 每个流式分片都 setHtml 重画整段对话，又慢又把滚动条顶回去；
+            # 合并成 ~60ms 一次，既顺滑也不丢内容（结束时会再完整渲染一次）。
+            self._render_soon()
+
+    def _render_soon(self):
+        timer=getattr(self,'_render_timer',None)
+        if timer is None:
+            timer=QTimer(self);timer.setSingleShot(True);timer.setInterval(60)
+            timer.timeout.connect(self.render);self._render_timer=timer
+        if not timer.isActive():
+            timer.start()
 
     def status_error(self,text):
         if self._bubble_voice_long_call and self.voice:
@@ -1024,8 +1130,9 @@ class AgentChatWindow(QDialog):
         if not manual_reply:self._voice_task = None
         if voice_task and self.voice_active and voice_task[0] is self.voice:
             self._voice_readback = True
+            from core.companion_dialogue import speech_answer
             self.voice.resolve_task(voice_task[1], dict(ok=result['ok'],
-                answer=result.get('text', '') if result['ok'] else '', error=result.get('error', '')))
+                answer=speech_answer(result.get('text','')) if result['ok'] else '', error=result.get('error', '')))
         elif self.voice_active and self.voice and not manual_reply:
             self._voice_readback=True
             from core.companion_dialogue import speech_answer
@@ -1036,14 +1143,15 @@ class AgentChatWindow(QDialog):
             self.store.append(ident, 'assistant', result['text'])
             self._remember_dialogue(self.store.conversation(ident)['agent_id'],'assistant',result['text'],ident)
             voice_reply=(self.read_aloud.isChecked() or manual_reply) and (not self.voice_active or manual_reply) and result.get('kind')!='dsh'
+            bubble=short_bubble_text(result['text'])
             if not self.voice_active and not self.isVisible() and not voice_reply:
-                self._show_active_bubble(result['text'])
+                self._show_active_bubble(bubble)
             self.status.setText('●  就绪')
             expression = result['expression'] if result.get('expression_explicit',result['expression']!='normal') else None
             if voice_reply:
                 from core.companion_dialogue import speech_answer
                 spoken=speech_answer(result['text']) if result.get('kind')=='answer' else result['text']
-                self._say_active_reply(result['text'],expression,result['action'],True,ident,spoken_text=spoken)
+                self._say_active_reply(bubble,expression,result['action'],True,ident,spoken_text=spoken)
             else:
                 if expression is not None:self._active_expression(expression)
                 if result['action'] != 'none':
@@ -1366,6 +1474,15 @@ class AgentChatWindow(QDialog):
         if not self.voice_active or self.sender() is not self.voice:
             return
         confirmed=False
+        try:
+            from core.reflex import match as match_reflex
+            reflex_command=match_reflex(request)
+        except Exception:
+            reflex_command=dict(matched=False)
+        if reflex_command.get('matched') and not reflex_command.get('need_model') and not self._pending_image:
+            self._pending_execution=None
+            self.voice._dispatch_fast(reflex_command,call_id)
+            return
         from core.fast_commands import match
         fast=match(request)
         if fast.get('matched') and not self._pending_image:
@@ -1509,8 +1626,53 @@ class AgentChatWindow(QDialog):
             from core.embodiment import spoken_reply
             self._show_active_bubble(spoken_reply(text)[2])
 
+    def _reflex_command(self, command, *, record_user=False, read_reply=False):
+        """Drive one referent desktop action on a worker; the receipt lands on fast_result."""
+        if self.busy or self._fast_inflight:
+            return self._finish_fast_command(dict(command,_conversation_id=None),
+                dict(ok=False,action_sent=False,verified=False,code='desktop_busy',
+                     error='当前已有任务占用桌面，这次没有操作；请等它结束后再说一遍'))
+        from core.reflex import execute as execute_reflex
+        self._pending_execution=None
+        self._fast_inflight=True
+        command=dict(command,_conversation_id=self.active_id,_read_reply=bool(read_reply),_reflex=True)
+        if record_user:
+            self.store.append(self.active_id,'user',str(command.get('source_text') or ''))
+        self._last_fast_result=dict(ok=True,execution_pending=True,message='正在照做…')
+        self.status.setText('正在照做…')
+        def work():
+            try:result=execute_reflex(command,desktop=getattr(self,'_browser_interaction',None))
+            except Exception:
+                result=dict(ok=False,action_sent=False,verified=False,need_model=True,
+                            message='界面这边我没有看清或没有做成，这次没有继续操作')
+            self.fast_result.emit(command,result)
+        import threading
+        threading.Thread(target=work,name='guga-reflex',daemon=True).start()
+        return self._last_fast_result
+
+    def _reflex_fallback(self, command, result):
+        """No unique target: give the same sentence back to the model exactly once."""
+        message=str(result.get('message') or '我没看清你指的是哪一块')
+        self._fast_inflight=False
+        self.status.setText(message)
+        if command.get('fast_id') and self.voice_active and self.voice:
+            # Long voice: the live model owns the turn and receives this honest receipt.
+            return self._finish_fast_command(dict(command,_reflex=False),
+                dict(result,ok=False,need_model=True,error=message))
+        text=str(command.get('source_text') or '')
+        self._last_fast_result=dict(result,ok=False,message=message)
+        if not text:
+            self._show_active_bubble(message);return self._last_fast_result
+        self._show_active_bubble(message)
+        read_reply=bool(command.get('_read_reply'))
+        QTimer.singleShot(0,lambda:self.send(text,record_user=False,_skip_local=True,read_reply=read_reply))
+        return self._last_fast_result
+
     def _fast_command(self, command):
         if command.get('fast_id') and not self.voice_active:return
+        if command.get('reflex'):
+            # Long-call transcripts and the speech model's function call share this receipt.
+            return self._reflex_command(command)
         if command.get('action') in ('daily_plan','dsh_link'):
             command=dict(command,_conversation_id=self.active_id)
             from core.daily_plan import format_plan
@@ -1643,6 +1805,8 @@ class AgentChatWindow(QDialog):
         return self._finish_fast_command(command,result)
 
     def _finish_fast_command(self,command,result):
+        if command.get('_reflex') and result.get('need_model'):
+            return self._reflex_fallback(command,result)
         if command.get('_receipt_id'):result=dict(result,receipt_id=command['_receipt_id'])
         if command.get('_async_launch'):
             self._fast_launch_count=max(0,getattr(self,'_fast_launch_count',0)-1)
@@ -1686,12 +1850,13 @@ class AgentChatWindow(QDialog):
             self.status.setText(result.get('message','快速命令已完成'))
             if command.get('_read_reply'):
                 self._say_active_reply(result.get('message','快速命令已完成'),speak=True)
-            if command.get('action') in ('browser_step','desktop_step'):self._show_active_bubble(result.get('message','已执行这一步'))
+            if command.get('action') in ('browser_step','desktop_step') or command.get('_reflex'):self._show_active_bubble(result.get('message','已执行这一步'))
             if command.get('_conversation_id'):
                 self.store.append(command['_conversation_id'],'assistant',result.get('message','快速命令已完成'))
                 self.render()
             return result
-        message='快速命令执行失败：'+str(result.get('error','未知原因'))
+        detail=str(result.get('error') or result.get('message') or '未知原因')
+        message=('这次没有做成：' if command.get('_reflex') else '快速命令执行失败：')+detail
         if command.get('_read_reply'):self._say_active_reply(message,speak=True)
         self.status.setText(message)
         self._show_active_bubble(message)
@@ -1767,6 +1932,17 @@ class AgentChatWindow(QDialog):
                 self.status.setText('通话已结束 · 阿里语音连接已关闭')
 
     def shutdown(self):
+        try:
+            from core.reflex import stop_foreground_tracker
+            stop_foreground_tracker()
+        except Exception:
+            pass
+        try:
+            # 浏览器反射复用了同一条 CDP 会话，退出时要关掉，别把连接留给下一次启动。
+            from core.super_agent import browser_reflex
+            browser_reflex.close_session()
+        except Exception:
+            pass
         self._manual_voice_timer.stop()
         self._task_speech.clear()
         self._screen_share_watchdog_timer.stop()

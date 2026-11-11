@@ -7,6 +7,10 @@ v2 修复（针对崩溃/磁盘泄漏）:
 - 临时 mp3 用完即删; 启动时清理本程序遗留的旧 mp3; _temp_files 限长防堆积。
 - 合成加超时保护, 防止 edge-tts asyncio 在网络异常时永久挂起。
 - 用 speak token 区分每次说话, stop()/新 speak 后旧合成完成不会误播。
+
+v3（语音链路修复）:
+- edge 合成失败时自动降级到豆包（旧逻辑只在 provider=='doubao' 才走豆包）。
+- 记录 last_error / _last_provider / _last_bytes；新增 self_check() 供 voice_health 调用。
 """
 import os
 import sys
@@ -79,6 +83,16 @@ class TTSEngine(QObject):
     def set_tutor_mode(self, on: bool):
         self._tutor_mode = bool(on)
 
+    def set_silent(self, on: bool):
+        """静默只关本机朗读播报；气泡、表情、长语音通话与音乐都不受影响。"""
+        self._silent = bool(on)
+        if self._silent:
+            self.stop()
+
+    @property
+    def silent(self):
+        return self._silent
+
     def _current_rate(self):
         return self.EDGE_RATE_TUTOR if self._tutor_mode else self.EDGE_RATE
 
@@ -99,11 +113,16 @@ class TTSEngine(QObject):
         self._player.stateChanged.connect(self._on_state_changed)
         self._temp_files = []   # 主线程持有, 仅主线程修改
         self._is_speaking = False
+        self._silent = False    # 静默: 只关本地朗读播报
         self._session = None
         self._speak_token = 0   # 每次 speak 自增, 用于失效旧请求
         self._current_token = 0  # 当前正在播放的 token
         self._display_text = ''
         self._playback_announced = False
+        # 诊断字段: 供 core/voice_health.py、MCP 与 UI 自检读取
+        self.last_error = ''      # 最近一次合成/播放失败的短原因
+        self._last_provider = ''  # 最近一次成功合成用的通道: edge / doubao
+        self._last_bytes = 0      # 最近一次成功合成的音频字节数
 
         try:
             cfg_path = os.path.join(os.path.dirname(__file__), '..', 'ai_config.json')
@@ -148,13 +167,59 @@ class TTSEngine(QObject):
         except ImportError:
             return False
 
+    def self_check(self):
+        """不发声、不联网的自检快照，供 core/voice_health.py / MCP / UI 调用。
+
+        返回可直接 json.dumps 的 dict:
+          silent / provider / voice / edge_ok / doubao_ok / playback_ok /
+          last_error / last_provider / last_bytes / is_speaking / edge_host
+        真正的"能不能出声"由 core.voice_health.probe_speak() 实测。
+        """
+        edge_ok = bool(getattr(self, '_use_edge', False))
+        edge_host = ''
+        edge_error = ''
+        if edge_ok:
+            try:
+                edge_host = configure_edge_transport()
+            except Exception as e:
+                edge_ok = False
+                edge_error = str(e)
+        playback_ok = False
+        playback_error = ''
+        try:
+            playback_ok = bool(self._player.isAvailable())
+        except Exception as e:
+            playback_error = str(e)
+        provider = getattr(self, 'provider', 'edge') or 'edge'
+        voice = self.DOUBAO_VOICE if provider == 'doubao' else self.EDGE_VOICE
+        return {
+            'silent': bool(self._silent),
+            'provider': provider,
+            'voice': voice,
+            'edge_ok': edge_ok,
+            'doubao_ok': bool(self._use_doubao),
+            'playback_ok': playback_ok,
+            'last_error': self.last_error or '',
+            'last_provider': getattr(self, '_last_provider', ''),
+            'last_bytes': int(getattr(self, '_last_bytes', 0) or 0),
+            'is_speaking': bool(self._is_speaking),
+            'edge_host': edge_host,
+            'edge_error': edge_error,
+            'playback_error': playback_error,
+        }
+
     # ---- 对外: 说话 ----
     def speak(self, text: str, voice_profile=None):
+        if self._silent:
+            # 静默不是"合成失败"，但必须留下痕迹: 整机朗读与碎碎念都走这里
+            self.last_error = 'silent=true（agent/silent 开启，本机朗读被静默）'
+            return
         if not text.strip():
             return
         text = strip_punct(text)
         if not text.strip():
             return
+        self.last_error = ''
         # 中断当前播放并递增 token, 让进行中的旧合成即使完成也不会被播放
         self._stop_playback()
         self._speak_token += 1
@@ -198,25 +263,39 @@ class TTSEngine(QObject):
             tmp.close()
 
             success = False
-            if self._use_edge and (getattr(self,'provider','edge')=='edge' or voice_profile):
-                success = self._synth_edge(text,tmp_path,voice_profile) if voice_profile else self._synth_edge(text,tmp_path)
-            # A failed companion voice must not silently become Guga's fallback.
-            if not success and self._use_doubao and not voice_profile and getattr(self,'provider','edge')=='doubao':
+            used = ''
+            provider = getattr(self, 'provider', 'edge')
+            if self._use_edge and (provider == 'edge' or voice_profile):
+                success = self._synth_edge(text, tmp_path, voice_profile)
+                if success:
+                    used = 'edge'
+            # edge 合成失败（或配置直接指定豆包）时，只要豆包可用就自动降级；
+            # 但伙伴自定义音色(voice_profile)合成失败不得悄悄变成咕嘎的声音。
+            if not success and self._use_doubao and not voice_profile:
                 success = self._synth_doubao(text, tmp_path)
+                if success:
+                    used = 'doubao'
 
             if not success:
+                if not self.last_error:
+                    self.last_error = '合成失败（edge 与豆包均不可用）'
                 # 失败: 清掉空文件, 通知主线程收尾
                 self._safe_remove(tmp_path)
                 self._synth_failed.emit(token)
                 return
 
             # 校验文件有效
-            if not (os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 100):
+            size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+            if not (size > 100):
+                self.last_error = f'合成音频无效（{size} 字节）'
                 self._safe_remove(tmp_path)
                 self._synth_failed.emit(token)
                 return
 
-            # 成功: 通知主线程播放
+            # 成功: 记录通道与字节数, 通知主线程播放
+            self.last_error = ''
+            self._last_provider = used
+            self._last_bytes = size
             self._synth_ready.emit(token, tmp_path)
         except Exception as e:
             print(f"[TTS] synth_worker 错误: {e}", file=sys.stderr)
@@ -246,12 +325,17 @@ class TTSEngine(QObject):
                 asyncio.run(asyncio.wait_for(_synth(), timeout=_SYNTH_TIMEOUT))
             except asyncio.TimeoutError:
                 print("[TTS] edge-tts 合成超时", file=sys.stderr)
+                self.last_error = 'edge-tts 合成超时'
                 self._safe_remove(out_path)
                 return False
-            return os.path.exists(out_path) and os.path.getsize(out_path) > 100
+            ok = os.path.exists(out_path) and os.path.getsize(out_path) > 100
+            if not ok:
+                self.last_error = 'edge-tts 返回空音频'
+            return ok
 
         except Exception as e:
             print(f"[TTS] edge-tts 错误: {e}", file=sys.stderr)
+            self.last_error = f'edge-tts 错误: {e}'
             self._safe_remove(out_path)
             return False
 
@@ -305,10 +389,12 @@ class TTSEngine(QObject):
                 with open(out_path, 'wb') as f:
                     f.write(audio_data)
                 return True
+            self.last_error = '豆包语音返回空音频'
             return False
 
         except Exception as e:
             print(f"[TTS] 豆包语音错误: {e}", file=sys.stderr)
+            self.last_error = f'豆包语音错误: {e}'
             self._safe_remove(out_path)
             return False
 
@@ -336,6 +422,7 @@ class TTSEngine(QObject):
             self._player.play()
         except Exception as e:
             print(f"[TTS] 播放错误: {e}", file=sys.stderr)
+            self.last_error = f'播放失败: {e}'
             self._safe_remove(path)
             self._is_speaking = False
             self.speech_failed.emit('本机语音播放失败')
@@ -347,6 +434,8 @@ class TTSEngine(QObject):
     def _on_synth_failed(self, token: int):
         if token != self._speak_token:
             return
+        if not self.last_error:
+            self.last_error = '合成失败'
         self._is_speaking = False
         self.speech_failed.emit('本机语音合成失败')
         try:

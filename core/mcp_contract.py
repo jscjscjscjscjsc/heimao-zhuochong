@@ -33,11 +33,20 @@ def extension_tools():
                  query=dict(type='string'),title=dict(type='string'),content=dict(type='string')),
                  required=['action'],additionalProperties=False)),
         dict(name='dsh_gateway',
-             description='直连本机 DSH web 网关（127.0.0.1:3080，0 重启）：status 列出正在运行的会话；session 读取会话投影（标题/进度/待办）；prompt 向指定会话投递一条用户消息（写操作，必须给出 session_id，不允许猜目标）。用于指挥正在运行的 DeepSeek Harness 会话。',
+             description='直连本机 DSH web 网关（127.0.0.1:3080，0 重启）：create 新建一个空会话并返回 session_id；start 新建会话并立刻投第一条指令；prompt 向指定会话投递一条用户消息（写操作，必须给出 session_id，不允许猜目标）；status/session 用于查看。要新建 DSH 对话请用 create/start，不要用桌面控制在 DSH 窗口里点按钮。',
              inputSchema=dict(type='object',properties=dict(
-                 action=dict(type='string',enum=['status','session','prompt']),
+                 action=dict(type='string',enum=['status','session','prompt','create','start']),
                  session_id=dict(type='string'),text=dict(type='string'),
                  mode=dict(type='string',enum=['queue','steer']),query=dict(type='string')),
+                 required=['action'],additionalProperties=False)),
+        dict(name='workflow',
+             description='咕嘎的多步操作工作流库：list 同时列出 UIA 录制型（workflows）与工具调用型（tool_workflows）；play 回放 UIA 型（先自动预检，界面状态不一致就一步都不执行）；plan 对工具调用型做静态校验（工具名/必填参数/人工确认闸），不执行动作；compile 把自然语言长指令编译成 UIA 步骤并保存。',
+             inputSchema=dict(type='object',properties=dict(
+                 action=dict(type='string',enum=['list','status','play','plan','run','compile']),
+                 slug=dict(type='string'),text=dict(type='string'),
+                 title=dict(type='string'),triggers=dict(type='string'),
+                 allow_confirm=dict(type='boolean'),allow_dangerous=dict(type='boolean'),
+                 start_at=dict(type='integer'),dry_run=dict(type='boolean')),
                  required=['action'],additionalProperties=False)),
     ]
 
