@@ -21,13 +21,34 @@ class Results(HTMLParser):
         if self.item is not None:
             key='title' if self.anchor else 'snippet'
             self.item[key]+=data+' '
-def search(query):
-    query=str(query).strip()[:300]
-    if not query:raise ValueError('搜索关键词不能为空')
-    response=requests.get('https://www.bing.com/search',params={'q':query,'setlang':'zh-hans'},headers={'User-Agent':'Mozilla/5.0'},timeout=(5,8))
+def _clean_title(value):
+    text = re.sub(r'\s+', ' ', str(value or '')).strip()
+    text = re.sub(r'^\S+\.\w{2,}\s+https?://\S+\s*(?:›\s*)?', '', text)
+    text = re.sub(r'^https?://\S+\s*', '', text)
+    return text[:160]
+
+
+def search(query, max_results=4):
+    """Public snippets only; the caller treats them as untrusted material."""
+    query = str(query).strip()[:300]
+    if not query: raise ValueError('搜索关键词不能为空')
+    response = requests.get('https://www.bing.com/search', params={'q': query, 'setlang': 'zh-hans'},
+                            headers={'User-Agent': 'Mozilla/5.0'}, timeout=(5, 8))
     try:
         response.raise_for_status()
-        parser=Results();parser.feed(response.text[:2_000_000])
-    finally:response.close()
-    results=[dict(title=r['title'].strip()[:160],url=r['url'],snippet=re.sub(r'\s+',' ',r['snippet']).strip()[:550]) for r in parser.results[:5]]
-    return dict(ok=bool(results),results=results,message='公开搜索摘要，引用来源后汇报；摘要不等于已核实全文' if results else '搜索页没有可读取摘要，可能为验证页；不能编造搜索结果')
+        parser = Results(); parser.feed(response.text[:2_000_000])
+    finally:
+        response.close()
+    found, seen = [], set()
+    for item in parser.results:
+        url = str(item.get('url') or '').strip()
+        if not url.startswith(('http://', 'https://')) or url in seen:
+            continue
+        seen.add(url)
+        found.append(dict(title=_clean_title(item.get('title')) or url[:60], url=url,
+                          snippet=re.sub(r'\s+', ' ', str(item.get('snippet') or '')).strip()[:550]))
+        if len(found) >= int(max_results):
+            break
+    return dict(ok=bool(found), results=found,
+                message='公开搜索摘要，引用来源后汇报；摘要不等于已核实全文' if found
+                else '搜索页没有可读取摘要，可能为验证页；不能编造搜索结果')

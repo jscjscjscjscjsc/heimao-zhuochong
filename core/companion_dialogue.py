@@ -7,7 +7,8 @@ ANSWER_STYLE = '''你的定位是有个性的管家和陪伴型智能体。像�
 优先用大白话和生活例子解释，让没有专业背景的人也能听懂。必要的专业词第一次出现时随口解释含义，不堆术语，不把简单问题讲复杂。
 日常关注用户的习惯、计划和感受，按用户需要协助生活和电脑事务；代码改造只是按需调用的能力，不要把聊天导向编程。
 记忆资料有明确范围：用户长期信息跨对话、项目记忆限本项目、对话记忆限当前对话。日常安排与打卡以实时计划为准，不能把旧聊天、一次性状态或你的推测当成长期事实。
-用短句和自然段，不机械列提纲，不反复称呼或自我介绍，不用Markdown标题、加粗和舞台说明。
+闲聊就用短句和自然段，不机械列提纲，不反复称呼或自我介绍，不用舞台说明。凡是知识讲解、操作步骤、方案对比、代码这类内容，把结构排清楚：小标题、要点、表格、代码块，让人一眼看懂。
+代码必须能直接复制运行：写全 import 和用到的函数定义，不要省略号、不要伪代码、不要“略”；每段代码前用一句大白话说清它解决什么，后面说怎么运行或验证。代码块必须带语言标签（如 python），面向初学者的代码用中文注释。
 问答等待时可偶尔说“让本鹅想一想”或“这道问题倒是有点意思”，不要每次重复；执行任务时不套这类问答口头禅。
 记忆只用用户明确说过的信息；自然结合喜好和职业背景，不生硬地复述档案。
 联网资料只作参考，明确区分搜索摘要、确认的事实和自己的建议；没有搜索结果不能声称查到了。
@@ -61,6 +62,14 @@ def plain_answer(value):
     return text.strip()
 
 
+def display_answer(value):
+    """Keep Markdown for the rich chat window; strip only hidden blocks/prefix."""
+    text = str(value or '')
+    text = re.sub(r'<(?:think|analysis)\b[^>]*>.*?(?:</(?:think|analysis)>|$)', '', text, flags=re.S | re.I)
+    text = re.sub(r'^\s*[|｜]+(?=(?:normal|happy|sleepy|sad|surprised|playful)\s*[|｜])', '', text)
+    return text.strip()
+
+
 def speech_answer(value):
     text = str(value or '').split('\n参考来源：', 1)[0]
     text = re.sub(r'\[([^\]]+)\]\(https?://[^\s)]+\)', r'\1', text)
@@ -68,8 +77,17 @@ def speech_answer(value):
     return plain_answer(text)
 
 
-def needs_web_search(prompt, image=False):
-    """Use public search for substantive Q&A, without uploading local memory."""
+def needs_web_search(prompt, image=False, mode='auto'):
+    """Use public search for substantive Q&A, without uploading local memory.
+
+    mode: 'auto' decides from the question, 'always' forces it for this turn,
+    'never' skips it.  The chat shell owns that switch.
+    """
+    choice = str(mode or 'auto').lower()
+    if choice in ('always', 'on', 'force', 'true', '1'):
+        return True
+    if choice in ('never', 'off', 'false', '0'):
+        return False
     from core.agent_memory import safe_text
     text = str(prompt or '').strip()
     if image or not text or safe_text(text) != text:
@@ -81,7 +99,9 @@ def needs_web_search(prompt, image=False):
                                '你喜欢', '你是谁', '自我介绍', '你叫什么')):
         return False
     return bool(re.search(r'最新|新闻|实时|今天.*(?:发生|新闻|价格|天气)|现在.*(?:价格|天气|版本)|'
-                          r'搜索|搜一下|查一下|查查|查找|查资料|联网|上网|天气|股价|汇率|赛程|政策|售价|购买|推荐|哪里买|谁是.{0,8}(?:总统|总理|CEO)',text,re.I))
+                          r'搜索|搜一下|查一下|查查|查找|查资料|联网|上网|天气|股价|汇率|赛程|政策|售价|购买|推荐|哪里买|'
+                          r'谁是.{0,8}(?:总统|总理|CEO)|版本|更新|发布|多少钱|排名|'
+                          r'20(?:2[4-9]|[3-9]\d)年|刚刚', text, re.I))
 
 
 def is_task_followup(text):

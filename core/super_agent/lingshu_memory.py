@@ -26,7 +26,15 @@ _STATE = dict(items=[], at=0.0, refreshing=False, error='', writes=0, last_write
 
 
 def _enabled() -> bool:
-    return os.environ.get('GUGA_LINGSHU', 'on').strip().lower() not in ('off', '0', 'false', 'no')
+    """两把总开关任一关闭就不碰记忆。
+
+    `GUGA_SUPER_AGENT=off` 是「整套超级智能体关闭」（测试/现场静默），
+    以前只认 `GUGA_LINGSHU`，导致测试跑一遍就把假文案写进主人的真实认知图。
+    """
+    for name in ('GUGA_SUPER_AGENT', 'GUGA_LINGSHU'):
+        if os.environ.get(name, 'on').strip().lower() in ('off', '0', 'false', 'no'):
+            return False
+    return True
 
 
 def _log(event: str, payload: dict):

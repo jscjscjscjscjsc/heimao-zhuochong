@@ -446,6 +446,44 @@ class DesktopInteraction:
             raise RuntimeError(f'{missing}；视觉坐标不支持安全填写与回读，未发送操作')
         return None, self._resolve_visual(identity, target)
 
+    def _activate_browser(self):
+        """Bring an existing browser window forward when Guga itself is foreground.
+
+        Typing in Guga's own chat leaves Guga as the foreground window, so a
+        browser step would otherwise be refused as "own window". Focus is only
+        moved when the user is not working in another application.
+        """
+        import win32con
+        import win32gui
+        import win32process
+        try:
+            foreground = int(win32gui.GetForegroundWindow() or 0)
+            if not foreground:
+                return None
+            if win32process.GetWindowThreadProcessId(foreground)[1] != os.getpid():
+                return None
+            from core.window_inventory import list_windows
+            windows = [window for window in list_windows('浏览器', 50)
+                       if int(window.get('pid', 0)) != os.getpid()]
+        except Exception:
+            return None
+        if not windows:
+            return None
+        selected = next((window for window in windows if window.get('foreground')), windows[0])
+        hwnd = int(selected['hwnd'])
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            return None
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if int(win32gui.GetForegroundWindow() or 0) == hwnd:
+                return hwnd
+            time.sleep(0.03)
+        return None
+
     def execute(self, command, hwnd=None):
         started = time.perf_counter()
 
@@ -480,6 +518,10 @@ class DesktopInteraction:
                     _input_method_question(command.get('source_text', '')) or
                     _unsafe_input(command.get('source_text', ''))):
                 raise ValueError('输入法问句或复合输入不是单步填写，本次未发送操作')
+            if command.get('kind') == 'browser':
+                activated = self._activate_browser()
+                if activated:
+                    hwnd = activated
             identity = self._guard(hwnd)
             hwnd = identity['hwnd']
             if is_list:

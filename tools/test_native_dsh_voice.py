@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock,patch
@@ -35,24 +36,68 @@ class NativeDshTests(unittest.TestCase):
         self.link.receive(dict(session_id='_host_',kind='host/heartbeat'))
         self.assertTrue(self.link.status()['connected']);self.assertEqual(self.link.status()['sessions'],[])
 
-    def test_status_and_periodic_narration_are_real_and_bounded(self):
+    def test_progress_is_narrated_once_per_minute(self):
+        # 主人指定（2026-11-11）：运行中每 60 秒组织一次自然语言进度，心跳再密也不多报。
         self.event(goal='通过咕嘎打开浏览器',turn=1,summary='正在调用 applications')
-        self.link.tick();self.assertEqual(self.panel._say_active_reply.call_count,1)
+        self.link.tick()                                            # 刚开始，未到 60 秒
+        self.assertEqual(self.panel._say_active_reply.call_count,0)
+        # 到 60 秒：本测试关掉了超级智能体，直接说确定性文案。
+        self.now+=61;self.event(kind='heartbeat');self.link.tick()
+        self.assertEqual(self.panel._say_active_reply.call_count,1)
         self.assertIn('打开浏览器',self.panel._say_active_reply.call_args.args[0])
-        self.link.tick();self.assertEqual(self.panel._say_active_reply.call_count,1)
-        self.now+=31;self.event(kind='heartbeat');self.link.tick()
-        self.assertEqual(self.panel._say_active_reply.call_count,2)
-        self.assertIn('操作软件',self.panel._say_active_reply.call_args.args[0])
         self.assertNotIn('当前目标',self.panel._say_active_reply.call_args.args[0])
+        # 同一个节拍内，心跳再密也不该再打扰。
+        for _ in range(3):
+            self.now+=15;self.event(kind='heartbeat');self.link.tick()
+        self.assertEqual(self.panel._say_active_reply.call_count,1)
+        # 再过一个完整周期 → 再报一次。
+        self.now+=20;self.event(kind='heartbeat');self.link.tick()
+        self.assertEqual(self.panel._say_active_reply.call_count,2)
 
-    def test_interleaved_sessions_do_not_mix_goals(self):
+    def test_stall_does_not_add_reports_between_beats(self):
+        # 长时间没有新进展也不额外插话：节奏只由 60 秒决定。
+        self.event(goal='跑一个长任务',summary='正在调用 applications')
+        self.now+=61;self.event(kind='heartbeat');self.link.tick()
+        self.now+=1;self.event(kind='heartbeat');self.link.tick()
+        self.assertEqual(self.panel._say_active_reply.call_count,1)
+        for _ in range(2):
+            self.now+=20;self.event(kind='heartbeat');self.link.tick()
+        self.assertEqual(self.panel._say_active_reply.call_count,1)
+
+    def test_finished_task_speaks_verdict_and_next_step_as_one_line(self):
+        # 任务跑完：先验收、再组织下一步，合并成一条说，不连发两条。
+        with patch('core.super_agent.finish_review.review',
+                   return_value=dict(ok=True,verdict='unverified',
+                                     reasons=['没有声明检查命令'],
+                                     next_step='这轮跑完了，但我还没有能独立验证的检查项。')):
+            self.event(turn=1)
+            self.event(kind='turn/end',state='finished',turn=1,summary='本轮结束')
+            for _ in range(100):
+                if self.link.sessions['session-1'].get('review_result'):break
+                time.sleep(0.02)
+            self.now+=1;self.link.tick()
+            self.assertEqual(self.panel._say_active_reply.call_count,1)
+            self.assertIn('检查项',self.panel._say_active_reply.call_args.args[0])
+            # 同一条结论不会重复播报。
+            self.now+=1;self.link.tick()
+            self.assertEqual(self.panel._say_active_reply.call_count,1)
+
+    def test_focus_stays_put_instead_of_hopping_between_sessions(self):
         self.event(kind='user/message',goal='任务A')
         self.event(session='session-2',kind='user/message',goal='任务B')
-        self.event(summary='A的工具结果')
-        self.link.tick()
-        self.assertIn('任务B',self.panel._say_active_reply.call_args.args[0])
-        self.assertNotIn('A的工具结果',self.panel._say_active_reply.call_args.args[0])
+        self.assertEqual(self.link.focused_session,'session-1')
         self.assertEqual(len(self.link.status()['sessions']),2)
+        self.link.tick()
+        self.assertEqual(self.panel._say_active_reply.call_count,0)
+
+    def test_long_silence_does_not_claim_completion(self):
+        # 长时间没动静只按 60 秒节拍汇报，绝不谎称任务已结束。
+        self.event(goal='跑一个长任务',summary='正在调用 applications')
+        self.now+=61;self.event(kind='heartbeat');self.link.tick()
+        self.now+=1;self.event(kind='heartbeat');self.link.tick()
+        self.assertEqual(self.panel._say_active_reply.call_count,1)
+        self.assertNotIn('干完啦',self.panel._say_active_reply.call_args.args[0])
+        self.assertEqual(self.link.status()['sessions'][0]['state'],'running')
 
     def test_missing_heartbeat_never_claims_completion(self):
         self.event(summary='DSH 正在处理')
@@ -77,8 +122,9 @@ class NativeDshTests(unittest.TestCase):
     def test_active_voice_gets_context_and_narration_without_new_connection(self):
         self.panel.voice=MagicMock();self.panel.voice_active=True
         self.event(goal='打开浏览器',summary='正在执行')
-        self.link.tick()
-        self.panel.voice.set_task_context.assert_called_once()
+        self.now+=61;self.event(kind='heartbeat');self.link.tick()   # 到点组织
+        self.now+=1;self.event(kind='heartbeat');self.link.tick()    # 60 秒节拍播报
+        self.panel.voice.set_task_context.assert_called()
         self.panel.voice.notify_battleground.assert_called_once()
         self.panel._say_active_reply.assert_not_called()
 

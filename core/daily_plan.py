@@ -186,6 +186,36 @@ class DailyPlan:
         return '今天已经勾选完成了'+names+'，一共%d/%d项。每一件都算进步，做得好，剩下的按你的节奏来。'%(state['completed'],state['total'])
 
 
+def split_titles(body):
+    """把一段计划文字切成一条条具体事项。
+
+    2026-11-12：原来只按 [\\n；;、，,] 切，**句号和问号都不认**，
+    用户把计划写成「数学一小时。 算法一小时。」时只会被切成一条。
+    另外要剥掉「每日计划：」这类抬头和序号前缀（1. ① - •）。
+    超长条目按空格再拆一次，实在拆不开才截断到 200 字（不能整段丢掉）。
+    """
+    text = re.sub(r'^\s*(?:每日计划|每日清单|我的每日计划|我的每日清单)\s*[：:]?\s*',
+                  '', str(body or ''))
+    # 2026-11-12：序号本身也是分隔信号。「1. 背单词 2. 跑步」和「①数学 ②算法」
+    # 原来会因为序号前面只有空格、没有标点而切成一条，这里先把序号前补成换行。
+    text = re.sub(r'\s+(?=\d{1,2}[.)、]\s)', '\n', text)
+    text = re.sub(r'\s*(?=[①②③④⑤⑥⑦⑧⑨⑩])', '\n', text)
+    out = []
+    for item in re.split(r'[\n；;、，,。！!？?]+', text):
+        item = re.sub(r'^\s*(?:[-•·]\s*|\d+[.)、]\s*|[①②③④⑤⑥⑦⑧⑨⑩]\s*)', '', item).strip()
+        item = item.strip(' ：:')
+        if len(item) < 2:
+            continue
+        if len(item) > 200:
+            parts = [p.strip() for p in re.split(r'\s+', item) if len(p.strip()) >= 2]
+            if len(parts) > 1:
+                out.extend(p[:200] for p in parts)
+                continue
+            item = item[:200]
+        out.append(item)
+    return out[:50]
+
+
 def parse_command(text):
     """Explicit commands and unambiguous first-person recurring plans."""
     value = str(text).strip().rstrip('。！!')
@@ -208,8 +238,12 @@ def parse_command(text):
     match = re.fullmatch(r'(?:(?:设置|修改)(?:我的)?)?(?:每日计划|每日清单)\s*[：:]\s*(.+)', value, re.S)
     if match:
         # Additive, preserves existing tasks and checks. Removal requires explicit delete.
-        if re.search(r'每周|工作日|周末|星期|改成|改为|改到',match[1]):return None
-        titles = [re.sub(r'^(?:[-•]\s*|\d+[.)]\s*)','',x.strip()) for x in re.split(r'[\n；;、，,]+', match[1]) if x.strip()]
+        # 2026-11-12：原来一看到「每周/星期」就整段放弃、推给模型；模型手里只有
+        # add（单条），于是把整段塞成一条——库里那条 200 字记录就是这么来的。
+        # 现在只有真正的"修改语义"才放弃，周几交给模型按 add_many 的 weekdays 处理。
+        if re.search(r'改成|改为|改到',match[1]):return None
+        titles = split_titles(match[1])
+        if not titles:return None
         return dict(action='add_many', titles=titles)
     return parse_routine(value)
 
@@ -225,10 +259,11 @@ def parse_routine(text):
         r'我(?:以后|从现在起|接下来)?(?:每天|每日)(?:都)?(?:计划|打算|要)?[：:，,\s]*)(.+)',value,re.S)
     if not match:return None
     body=match[1].strip()
-    if re.search(r'每周|工作日|周末|星期|不想|不再|不要|取消|删除|改成|改为|改到|改一下|改一改|不确定|可能|希望你|你觉得|你帮|帮我|提醒我|今天|明天|以后再|忘记|是什么|怎么|如何|哪些',body):return None
-    titles=[re.sub(r'^(?:[-•]\s*|\d+[.)、]\s*|我(?:每天|每日)(?:都)?(?:要)?)','',x.strip()).strip()
-            for x in re.split(r'[\n；;、，,。]+',body) if x.strip()]
-    if not titles or any(not x or len(x)>200 for x in titles):return None
+    if re.search(r'不想|不再|不要|取消|删除|改成|改为|改到|改一下|改一改|不确定|可能|希望你|你觉得|你帮|帮我|提醒我|今天|明天|以后再|忘记|是什么|怎么|如何|哪些',body):return None
+    # 2026-11-12：body 里出现「每周/星期」不再整段放弃（那是排期信息，不是修改语义），
+    # 切分也改用 split_titles，认句号和序号。
+    titles=split_titles(body)
+    if not titles:return None
     return dict(action='add_many',titles=titles)
 
 

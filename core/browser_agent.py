@@ -48,5 +48,8 @@ def open_page(computer,url,cancel):
     except (RuntimeError,ValueError,OSError) as exc:
         return dict(ok=False,launch_requested=True,error='网址已提交，但未完成页面验证：'+str(exc))
     return dict(ok=True,result=dict(observation,url_requested=url,launch_requested=True,
-        page_verified=False,accessibility=accessibility,
-        message='真实浏览器窗口已观察；请根据截图/地址栏复查目标网址和加载结果，不能仅凭启动回执声称打开成功'))
+        page_verified=False,accessibility=accessibility,task_complete=True,
+        message=('网址已经交给用户的默认浏览器打开，真实窗口也已观察到——'
+                 '**这一步就算做完了**。不要再 open 一遍、不要换成专用浏览器再开一次、'
+                 '也不要为了「确认是否打开」而重复尝试；需要看页面内容就直接用 '
+                 'computer 的 observe 看当前这个窗口。')))

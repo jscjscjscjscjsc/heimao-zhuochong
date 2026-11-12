@@ -12,6 +12,8 @@ import time
 MAX_CHARS = 460
 _GW = {'at': 0.0, 'text': '', 'refreshing': False, 'error': ''}
 _GW_LOCK = threading.Lock()
+# 已经说过的附注，重复的就不再拼进去（否则 30 秒汇报会整段复读）。
+_SEEN = {'memory': '', 'dsh': ''}
 
 
 def _enabled() -> bool:
@@ -81,15 +83,21 @@ def _dsh_line() -> str:
 
 def compose(base_text: str, with_screen: bool = True, with_memory: bool = False,
             memory_query: str = '') -> str:
-    """拼出一句自然、口语化的 30 秒汇报。"""
+    """拼出一句自然、口语化的 30 秒汇报；同一句附注只出现一次，不跟着复读。"""
     if not _enabled():
         return str(base_text or '')[:MAX_CHARS]
     parts = [str(base_text or '').strip()]
     if with_screen:
         parts.append(_screen_line())
     if with_memory:
-        parts.append(_memory_line(memory_query))
-    parts.append(_dsh_line())
+        line = _memory_line(memory_query)
+        if line and line != _SEEN['memory']:
+            _SEEN['memory'] = line
+            parts.append(line)
+    line = _dsh_line()
+    if line and line != _SEEN['dsh']:
+        _SEEN['dsh'] = line
+        parts.append(line)
     text = '  '.join(part for part in parts if part)
     return text[:MAX_CHARS]
 

@@ -15,6 +15,23 @@ ROUTER_VERSION='2026-11-10.native-dsh.voice-context.1'
 SCREEN_CONTEXT_MIN_INTERVAL=10
 
 
+def local_action_match(text):
+    """Reflex referent actions win over the generic step parser.
+
+    The old parser happily turns "点这里" into click target "这里" and fails on a
+    real desktop, so a reflex phrase marked ambiguous must be reported as no
+    match: the model keeps the turn instead of a wrong local click.
+    """
+    try:
+        from core.reflex import match as match_reflex
+        reflex=match_reflex(text)
+    except Exception:
+        reflex={}
+    if reflex.get('matched'):
+        return dict(matched=False) if reflex.get('need_model') else reflex
+    return match_fast_command(text)
+
+
 DELEGATE_TOOL = dict(type='function', name='ask_deepseek',
     description='知识问答交给独立联网问答通道；电脑操作交给后台执行器，由宿主区分。事实、时效、资料与建议问题调用本工具搜索后回答；闲聊、当前画面及已有任务事实可直接说。后台忙碌不影响问答，不得把问答当成执行命令。',
     parameters=dict(type='object', properties=dict(request=dict(type='string',
@@ -241,7 +258,7 @@ class AgentRealtimeVoice(RealtimeVoice):
             # question never degrades into "turn sharing on first".
             self.screen_question_requested.emit(call_id,request)
             return
-        fast=match_fast_command(request)
+        fast=local_action_match(request)
         if fast.get('matched'):
             self._dispatch_fast(fast,call_id)
         else:
@@ -261,8 +278,9 @@ class AgentRealtimeVoice(RealtimeVoice):
     def _dispatch_fast(self,command,call_id=None):
         """Share one real execution between transcript and speech-model FC."""
         key=command_key(command);now=time.monotonic();cached=None;dispatch=None
+        desktop=bool(command.get('action') in ('browser_step','desktop_step') or command.get('reflex'))
         with self._state_lock:
-            if command.get('action') in ('browser_step','desktop_step'):
+            if desktop:
                 self._manual_browser_until=now+60
                 self._proactive_notices.clear()
                 self._proactive_pending_keys.clear()
@@ -279,9 +297,9 @@ class AgentRealtimeVoice(RealtimeVoice):
                 ident=uuid.uuid4().hex
                 if len(self._fast_jobs)>=64:self._fast_jobs.pop(next(iter(self._fast_jobs)))
                 self._fast_jobs[ident]=dict(key=key,started=now,epoch=self._input_epoch,result=None,
-                    browser_step=command.get('action') in ('browser_step','desktop_step'),waiters=[call_id] if call_id else [])
+                    browser_step=desktop,reflex=bool(command.get('reflex')),waiters=[call_id] if call_id else [])
                 dispatch=dict(command,fast_id=ident,recognized_at=now,asr_after_speech_ms=self._last_asr_delay_ms)
-                if command.get('action') in ('browser_step','desktop_step'):
+                if desktop and not command.get('reflex'):
                     import win32gui
                     dispatch['_target_hwnd']=int(win32gui.GetForegroundWindow() or 0)
         if cached is not None:self.resolve_task(call_id,cached)
@@ -300,7 +318,7 @@ class AgentRealtimeVoice(RealtimeVoice):
         # Successful single browser steps already update the page and show an
         # immediate bubble. Another generated audio turn would keep the speaker
         # echo gate closed and swallow the user's next short instruction.
-        if ok and job.get('browser_step'):return
+        if ok and (job.get('browser_step') or job.get('reflex')):return
         if not waiters:
             # Transcripts can execute before the model's tool call. Announce
             # the actual receipt once without cancelling the native tool turn.
@@ -440,7 +458,7 @@ class AgentRealtimeVoice(RealtimeVoice):
             if self._audio_request_pending:self._cancel_on_created=True
             if self._response_id:self._send(dict(type='response.cancel',response_id=self._response_id))
             self._cancel_audio();self._last_activity=time.monotonic();self._proactive_notices.clear()
-            fast=match_fast_command(text)
+            fast=local_action_match(text)
             if fast.get('matched'):
                 self._dispatch_fast(fast)
                 self._pending_user_text=None
@@ -583,7 +601,7 @@ class AgentRealtimeVoice(RealtimeVoice):
             question = args.get('request', '').strip()
             if not question or len(question) > 16000:
                 raise ValueError('问题或任务需要 1—16000 字')
-            if self._input_text is not None or match_fast_command(question).get('matched'):
+            if self._input_text is not None or local_action_match(question).get('matched'):
                 self._handoff_request(call_id,self._input_text or question)
             else:
                 # Transcription often arrives just after FC. Give it a bounded
@@ -624,7 +642,7 @@ class AgentRealtimeVoice(RealtimeVoice):
             self._latency['asr_after_speech_ms']=self._last_asr_delay_ms
             text = event.get('transcript', '')
             self._input_text=text or None
-            fast=match_fast_command(text) if text else dict(matched=False)
+            fast=local_action_match(text) if text else dict(matched=False)
             if text and not fast.get('matched'):self._manual_browser_until=0
             if fast.get('matched'):
                 self._dispatch_fast(fast)

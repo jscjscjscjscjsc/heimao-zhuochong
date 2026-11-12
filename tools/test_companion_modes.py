@@ -61,6 +61,15 @@ class PresentationTests(unittest.TestCase):
         self.assertNotIn('https',speech_answer('先喝水[1]。\n参考来源：\n1. 标题\nhttps://example.com'))
         self.assertEqual(speech_answer('先喝水[1]。\n参考来源：\nurl'), '先喝水。')
 
+    def test_display_keeps_markdown_while_speech_strips_it(self):
+        from core.ai_chat import parse_reply
+        from core.companion_dialogue import display_answer
+        raw='|happy|none|## 建议\n**先喝水**。\n```python\nprint(1)\n```'
+        shown=parse_reply(display_answer(raw))[2]
+        self.assertIn('## 建议',shown);self.assertIn('```python',shown)
+        spoken=speech_answer(shown)
+        self.assertNotIn('##',spoken);self.assertNotIn('**',spoken);self.assertNotIn('```',spoken)
+
     def test_search_policy_and_identity_appropriate_openers(self):
         self.assertTrue(needs_web_search('今天上海的天气如何？'))
         self.assertFalse(needs_web_search('我喜欢喝茶'))
@@ -84,9 +93,11 @@ class AnswerTests(unittest.TestCase):
         response=MagicMock(status_code=200)
         response.iter_lines.return_value=[('data: '+json.dumps(dict(choices=[dict(delta=x)]))).encode() for x in
             (dict(reasoning_content='PRIVATE'),dict(content='<think>PRIVATE'),dict(content='</think>|happy|none|## 简短解释\n**可以这样理解。**[1]'))]+[b'data: [DONE]']
-        with patch('core.search_results.search',return_value=receipt) as search,patch('core.chat_answer.requests.post',return_value=response) as post:
-            worker.start('qa',[],'列表和元组有什么区别？',memory_context='用户喜欢乌龙茶')
-            end=time.monotonic()+3
+        with patch('core.chat_memory.recall_context',return_value=dict(state='empty',items=[])), \
+                patch('core.search_results.search',return_value=receipt) as search, \
+                patch('core.chat_answer.requests.post',return_value=response) as post:
+            worker.start('qa',[],'列表和元组有什么区别？',memory_context='用户喜欢乌龙茶',search_mode='always')
+            end=time.monotonic()+4
             while not results and time.monotonic()<end:APP.processEvents();time.sleep(.005)
             self.assertTrue(results)
         self.assertNotIn('PRIVATE',str(results)+str(drafts))
@@ -98,8 +109,8 @@ class AnswerTests(unittest.TestCase):
     def test_sources_are_real_search_receipts_and_not_spoken(self):
         result,payload=self.run_answer(dict(ok=True,results=[dict(title='文档',url='https://example.com/docs',snippet='测试摘要')]))
         self.assertTrue(result['ok']);self.assertEqual(result['search_state'],'ok')
-        self.assertIn('https://example.com/docs',result['text'])
-        self.assertNotIn('##',result['text']);self.assertNotIn('**',result['text'])
+        self.assertIn('[文档](https://example.com/docs)',result['text'])
+        self.assertIn('## 简短解释',result['text']);self.assertIn('**可以这样理解。**',result['text'])
         self.assertNotIn('example.com',speech_answer(result['text']))
         self.assertIn('不可信资料',payload['messages'][0]['content'])
 

@@ -1,0 +1,111 @@
+{
+  "schema": 1,
+  "slug": "tencent-meeting-to-bilibili",
+  "name": "腾讯会议录制 → 改名 → B站投稿前",
+  "goal": "把腾讯会议最新一条录制下载下来，改名成「待确认的视频标题」，校验后上传到 B 站投稿页并填好标题简介，停在发布按钮前等用户确认。",
+  "triggers": [
+    "把腾讯会议最新录制发到b站",
+    "腾讯会议录制传b站"
+  ],
+  "steps": [
+    {
+      "do": "browser",
+      "args": {
+        "action": "session_start"
+      },
+      "note": "开一个独立可见浏览器，登录态持久保存；不接管你现有标签"
+    },
+    {
+      "do": "browser",
+      "args": {
+        "action": "navigate",
+        "url": "https://meeting.tencent.com/"
+      },
+      "note": "进腾讯会议网页版；如果没登录，这一步会停在登录页，需要你手动扫码"
+    },
+    {
+      "do": "browser",
+      "args": {
+        "action": "snapshot"
+      },
+      "note": "观察页面，找「我的录制 / 录制文件」入口"
+    },
+    {
+      "do": "browser",
+      "args": {
+        "action": "download"
+      },
+      "note": "下载最新一条录制；文件名和保存目录以浏览器实际返回为准"
+    },
+    {
+      "do": "local_computer",
+      "args": {
+        "action": "list",
+        "path": "{{下载目录}}"
+      },
+      "note": "列出刚下载的文件，确认真的落盘（不猜文件名）"
+    },
+    {
+      "do": "local_computer",
+      "args": {
+        "action": "run",
+        "command": "Rename-Item -LiteralPath '{{下载文件全路径}}' -NewName '待确认的视频标题.mp4'"
+      },
+      "note": "改名；路径必须来自上一步的真实结果"
+    },
+    {
+      "do": "media_workflow",
+      "args": {
+        "action": "inspect",
+        "path": "{{待确认的视频标题.mp4 的绝对路径}}"
+      },
+      "note": "校验时长/分辨率/大小，确认文件没坏"
+    },
+    {
+      "do": "media_workflow",
+      "args": {
+        "action": "submission",
+        "path": "{{视频绝对路径}}",
+        "title": "待确认的视频标题"
+      },
+      "note": "生成投稿清单（标题/简介/标签草稿）"
+    },
+    {
+      "do": "browser",
+      "args": {
+        "action": "navigate",
+        "url": "https://member.bilibili.com/platform/upload/video/frame"
+      },
+      "note": "进 B 站投稿页；需要已登录的创作者账号"
+    },
+    {
+      "do": "browser",
+      "args": {
+        "action": "snapshot"
+      },
+      "note": "观察投稿页，定位上传控件"
+    },
+    {
+      "do": "browser",
+      "args": {
+        "action": "upload"
+      },
+      "note": "把「待确认的视频标题.mp4」塞进上传框"
+    },
+    {
+      "do": "browser",
+      "args": {
+        "action": "fill_form"
+      },
+      "note": "填标题和简介（用 media_workflow.submission 的产出）"
+    },
+    {
+      "do": "pet_say",
+      "args": {
+        "text": "投稿都填好了，发布按钮我不按——你自己看一眼再发。"
+      },
+      "note": "最后一道闸：发布是不可逆动作，必须由人按",
+      "confirm": true
+    }
+  ]
+}

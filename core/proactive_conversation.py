@@ -224,8 +224,10 @@ class ProactiveConversation(QObject):
                 self.last_result.update(state='superseded');return
             self._daily_last_at=time.monotonic()
         ident=getattr(panel,'active_id',None)
-        if ident:
-            panel.store.append(ident,'assistant',text);panel._remember_dialogue(panel.active_agent_id,'assistant',text,ident)
+        # 2026-11-12：碎碎念不再写进对话记录和长期记忆。
+        # 主人明确要求：主动唠嗑会污染上下文——后面每一轮对话都会把这段旁白
+        # 当成"咕嘎说过的话"带进去，越积越多，还会被当成任务进度来理解。
+        # 现在只显示在气泡里，不进 store、不进 memory。
         if hasattr(panel,'_say_active_reply'):
             panel._say_active_reply(text,'happy','none',speak=self.offline_speak,conversation_id=ident)
         else:

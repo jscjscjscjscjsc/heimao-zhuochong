@@ -295,6 +295,28 @@ class UIABackend:
             except Exception:raise RuntimeError('无法完整读取当前输入框，请先核对，未发送操作') from None
             return dict(hwnd=int(hwnd),element=item)
 
+    def element_from_point(self,hwnd,x,y,depth=6):
+        """The control under a screen point plus its ancestors; read-only, no action."""
+        import win32gui,win32con
+        from System.Windows import Point
+        x=int(x);y=int(y);depth=max(1,min(int(depth),8))
+        with self.lock:
+            element=self.AutomationElement.FromPoint(Point(float(x),float(y)))
+            if element is None:raise RuntimeError('鼠标位置没有可读取的控件')
+            hwnd=int(hwnd or win32gui.GetAncestor(win32gui.WindowFromPoint((x,y)),win32con.GA_ROOT) or
+                win32gui.GetForegroundWindow() or 0)
+            chain=[];node=element
+            for _ in range(depth):
+                if node is None:break
+                item,stored=self._entry(node,hwnd,0,cached=False)
+                if not item:break
+                chain.append(item)
+                if stored is not None:self.elements[item['ref']]=(stored,time.monotonic(),hwnd)
+                try:node=self.walker.GetParent(node)
+                except Exception:break
+            if not chain:raise RuntimeError('鼠标位置的控件已经失效')
+            return dict(hwnd=hwnd,point=dict(x=x,y=y),element=chain[0],chain=chain)
+
     def act(self,hwnd,operation,*,ref=None,name='',automation_id='',control_type='',value=''):
         with self.lock:
             element,item=self._resolve(hwnd,ref,name,automation_id,control_type)
@@ -328,7 +350,27 @@ class UIABackend:
                         method='FocusedKeyboard';self._replace_text_by_keys(int(hwnd),element,str(value)[:4000])
                 elif operation=='toggle':element.GetCurrentPattern(self.Patterns['toggle'].Pattern).Toggle();method='TogglePattern'
                 elif operation in ('expand','collapse'):element.GetCurrentPattern(self.Patterns[operation].Pattern).Expand() if operation=='expand' else element.GetCurrentPattern(self.Patterns[operation].Pattern).Collapse();method=operation.title()+'Pattern'
-                elif operation=='scroll':element.GetCurrentPattern(self.Patterns['scroll'].Pattern).Scroll(-1,-1);method='ScrollPattern'
+                elif operation=='scroll':
+                    # value 约定：正数向下/向右，负数向上/向左，绝对值=格数（默认 1）。
+                    # 原先写死 Scroll(-1,-1)：ScrollAmount 不接受 -1，必然抛异常，等于滚动从来没成功过。
+                    try:steps=int(str(value if value not in (None,'') else '1').strip())
+                    except Exception:steps=1
+                    pattern=element.GetCurrentPattern(self.Patterns['scroll'].Pattern)
+                    current=pattern.Current
+                    method='ScrollPattern'
+                    if current.VerticallyScrollable:
+                        base=current.VerticalScrollPercent
+                        base=0.0 if (base is None or base<0) else float(base)
+                        target=max(0.0,min(100.0,base+(8.0*steps)))
+                        try:pattern.SetScrollPercent(-1,target)
+                        except Exception:pattern.Scroll(0,3 if steps>0 else 1)
+                    elif current.HorizontallyScrollable:
+                        base=current.HorizontalScrollPercent
+                        base=0.0 if (base is None or base<0) else float(base)
+                        target=max(0.0,min(100.0,base+(8.0*steps)))
+                        try:pattern.SetScrollPercent(target,-1)
+                        except Exception:pattern.Scroll(3 if steps>0 else 1,0)
+                    else:raise RuntimeError('目标控件不支持滚动，未发送操作')
                 elif operation!='click':raise ValueError('未知UIA操作')
             except RuntimeError:raise
             except Exception:

@@ -9,7 +9,7 @@ from launcher import _prepare_qt
 _prepare_qt()
 from PyQt5.QtCore import QTimer
 from PyQt5.QtGui import QFontDatabase
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QMenu
 from ui.pet_window import PetWindow
 from ui.voice_dialog import VoiceCallDialog
 from core.realtime_voice import RealtimeVoice
@@ -33,11 +33,15 @@ with patch('core.keyboard_hook.KeyboardHook.start'), patch('ui.tts_engine.TTSEng
             input_text_tokens=156, input_audio_tokens=None, output_text_tokens=14, output_audio_tokens=53))))
     def finish():
         assert pet._agent_panel is None, 'startup must not build the full AI workspace'
-        actions=[a.text() for a in pet._tray.contextMenu().actions()]
-        assert any(text == '🎙 长语音 · 咕嘎智能体' for text in actions)
-        assert any(text == '💭 陪伴与碎碎念…' for text in actions)
+        tray = pet._tray.contextMenu()
+        actions = [a.text() for a in tray.actions() if not a.isSeparator()]
+        assert len(actions) <= 8, actions
+        assert '🎙️ 语音与说话' in actions, actions
+        nested = [a.text() for menu in tray.findChildren(QMenu) for a in menu.actions()]
+        assert '💭 陪伴与碎碎念…' in nested, nested
         # Both supplied videos must stay reachable from the pet's right-click menu.
         pet._ensure_pet_menu()
+        assert len([a for a in pet._pet_menu.actions() if not a.isSeparator()]) <= 8
         def find_menu(items, title):
             for item in items:
                 sub = item.menu()
