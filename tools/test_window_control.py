@@ -50,10 +50,8 @@ class WindowPhraseTests(unittest.TestCase):
                 command=match(text)
                 self.assertEqual(command['action'],'open_app')
                 self.assertEqual(command['target'],target)
-        compound=match('打开微信，找到小军')
-        self.assertEqual(compound['action'],'open_app')
-        self.assertEqual(compound['target'],'微信')
-        self.assertEqual(compound['remaining'],'找到小军')
+        # 有真实第二动作的复合句现在整句交给 agent，不再只做一半。
+        self.assertFalse(match('打开微信，找到小军')['matched'])
 
     def test_typing_verbs_are_not_treated_as_window_commands(self):
         command=match('在浏览器里搜索最大化功率')

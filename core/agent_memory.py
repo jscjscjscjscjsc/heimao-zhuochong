@@ -98,6 +98,9 @@ class AgentMemoryStore:
                     content TEXT NOT NULL, created REAL NOT NULL);
             ''')
             columns={row[1] for row in db.execute('PRAGMA table_info(agent_profiles)')}
+            for name,default in (('user_instructions',''),('user_address','饲养员')):
+                if name not in columns:
+                    db.execute("ALTER TABLE agent_profiles ADD COLUMN "+name+" TEXT NOT NULL DEFAULT '"+default+"'")
             if 'appearance' not in columns:db.execute("ALTER TABLE agent_profiles ADD COLUMN appearance TEXT NOT NULL DEFAULT 'guga'")
             # Additive migration: old dialogue is retained, never assigned to a guessed chat.
             for table, additions in (
@@ -122,6 +125,8 @@ class AgentMemoryStore:
                     if str(old.get('display_name','')).startswith('咕嘎 00'):specialty=profile['specialty']
                     if agent_id=='001' and specialty=='综合分析、通用任务、电脑操作与项目监督':specialty=profile['specialty']
                     personality=old.get('personality') or PERSONALITIES[agent_id]
+                    if agent_id=='001' and personality=='你是咕嘎，保留原来的娇憨、调皮、体贴的小企鹅人格。':
+                        personality=PERSONALITIES[agent_id]
                     voices=old.get('voice_settings')
                     if not voices or voices=='{}':voices=json.dumps(VOICES[agent_id])
                     db.execute('UPDATE agent_profiles SET display_name=?,role=?,specialty=?,expression=?,appearance=?,updated=?,personality=?,voice_settings=? WHERE agent_id=?',
@@ -142,7 +147,7 @@ class AgentMemoryStore:
     def profiles(self):
         with self.connect() as db:return [dict(r) for r in db.execute('SELECT * FROM agent_profiles ORDER BY agent_id')]
 
-    def update_profile(self,agent_id,specialty=None,expression=None,role=None,personality=None,voice_settings=None):
+    def update_profile(self,agent_id,specialty=None,expression=None,role=None,personality=None,voice_settings=None,user_instructions=None,user_address=None):
         profile=self.profile(agent_id)
         if not profile:raise ValueError('未知咕嘎编号')
         specialty=safe_text(specialty) if specialty is not None else profile['specialty']
@@ -150,6 +155,12 @@ class AgentMemoryStore:
         expression=expression if expression in ('normal','happy','sleepy','surprised','sad','playful') else profile['expression']
         if not specialty:raise ValueError('擅长领域不能为空')
         personality=safe_text(personality) if personality is not None else profile['personality']
+        instructions=profile.get('user_instructions','') if user_instructions is None else str(user_instructions).strip()
+        address=profile.get('user_address','饲养员') if user_address is None else str(user_address).strip()
+        if len(instructions)>8000 or safe_text(instructions)!=instructions:
+            raise ValueError('习惯与提示词最多 8000 字，不能包含密钥')
+        if not address or len(address)>20 or safe_text(address)!=address:
+            raise ValueError('称呼需要 1—20 字，不能包含密钥')
         if voice_settings is not None:
             if not isinstance(voice_settings,dict):raise ValueError('音色设置必须为对象')
             allowed={'qwen31','qwen30','edge_voice','edge_rate','edge_pitch'}
@@ -157,8 +168,8 @@ class AgentMemoryStore:
             if any(not isinstance(v,str) or not re.fullmatch(r'[A-Za-z0-9_+%.:-]{1,100}',v) for v in voice_settings.values()):raise ValueError('音色参数无效')
             voices=json.dumps(voice_settings)
         else:voices=profile['voice_settings']
-        with self.connect() as db:db.execute('UPDATE agent_profiles SET specialty=?,expression=?,role=?,updated=?,personality=?,voice_settings=? WHERE agent_id=?',
-            (specialty,expression,role,time.time(),personality,voices,str(agent_id)))
+        with self.connect() as db:db.execute('UPDATE agent_profiles SET specialty=?,expression=?,role=?,updated=?,personality=?,voice_settings=?,user_instructions=?,user_address=? WHERE agent_id=?',
+            (specialty,expression,role,time.time(),personality,voices,instructions,address,str(agent_id)))
         return self.profile(agent_id)
 
     def add_dialogue(self,agent_id,role,content,conversation_id=None,project_id=None):

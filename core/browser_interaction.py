@@ -4,6 +4,19 @@ import threading
 import time
 
 
+_WINDOW_WORDS=('浏览器','窗口','页面','网页','当前页面','当前窗口','这个页面','这个窗口')
+
+
+def _field_name(value):
+    """'在浏览器的输入框中输入X': 浏览器的 describes the window, not the field."""
+    target=str(value or '').strip().strip('“”"\'')
+    target=re.sub(r'^(?:浏览器|窗口|页面|网页|当前页面|当前窗口)(?:的|里的|中的)?','',target).strip()
+    target=re.sub(r'(?:里的|中的|的)$','',target).strip()
+    if not target or target in _WINDOW_WORDS:
+        return '输入框'
+    return target
+
+
 def parse_step(value,source_text=''):
     common=dict(matched=True,action='browser_step',kind='browser',silent=True,priority='fast',source_text=source_text or value)
     shortcuts={
@@ -33,7 +46,7 @@ def parse_step(value,source_text=''):
         original=re.search(r'(?:在|往|向)(.+?)(?:输入框|框)(?:里|内|中)?(?:输入|填写)[:：\s]*(.+)',source_text or value,re.S)
         text=(original.group(2) if original else named.group(2)).strip()
         if len(text)>=2 and (text[0],text[-1]) in (('“','”'),('"','"'),("'","'")):text=text[1:-1]
-        return dict(common,browser_action='fill_named',target=named.group(1).strip(),text=text)
+        return dict(common,browser_action='fill_named',target=_field_name(named.group(1)),text=text)
     typed=re.fullmatch(r'(追加输入|输入|键入|填写)[:：\s]*(.+)',value)
     if value.startswith(('输入法','输入框')):typed=None
     if typed:

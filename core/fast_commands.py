@@ -14,6 +14,19 @@ SITE_ALIASES={
     'google':'https://www.google.com','b站':'https://www.bilibili.com','哔哩哔哩':'https://www.bilibili.com',
     'bilibili':'https://www.bilibili.com','github':'https://github.com','知乎':'https://www.zhihu.com',
     'youtube':'https://www.youtube.com','微博':'https://weibo.com',
+    # 2026-11-12：原来只有上面 9 个站。其余网站（京东、淘宝…）不在表里，
+    # 就会被下面的「打开X」当成软件名交给 applications，报
+    # 「未找到名为X的软件」。用户说「打开京东」失败、说「打开京东官网」
+    # 反而成功（后者含"官网"被排除词挡下，交给了智能体用 browser 打开）。
+    # 这里补齐只有网站形态、基本不会被当本机软件的常见站点。
+    '京东':'https://www.jd.com','淘宝':'https://www.taobao.com','天猫':'https://www.tmall.com',
+    '豆瓣':'https://www.douban.com','掘金':'https://juejin.cn','csdn':'https://www.csdn.net',
+    '12306':'https://www.12306.cn','小红书':'https://www.xiaohongshu.com',
+    'mdn':'https://developer.mozilla.org','抖音':'https://www.douyin.com','快手':'https://www.kuaishou.com',
+    '贴吧':'https://tieba.baidu.com','百度贴吧':'https://tieba.baidu.com','百科':'https://baike.baidu.com',
+    '腾讯视频':'https://v.qq.com','爱奇艺':'https://www.iqiyi.com','优酷':'https://www.youku.com',
+    'pixiv':'https://www.pixiv.net','twitter':'https://x.com','推特':'https://x.com',
+    'stackoverflow':'https://stackoverflow.com','pypi':'https://pypi.org','菜鸟教程':'https://www.runoob.com',
 }
 APP_ALIASES={
     '记事本':'notepad.exe','计算器':'calc.exe','画图':'mspaint.exe','资源管理器':'explorer.exe',
@@ -93,6 +106,63 @@ def _browser_executable():
 def _open_url(url):
     from core.browser_launch import launch
     return launch(url)
+
+
+_TAIL_ONLY=re.compile(r'^(?:(?:一下|吧|好吗|可以吗|行吗|谢谢|呢|啊|哦|呀|然后|接着|再|请)(?:呢|吧|啊|哦|呀)?)?[。！？!?，,\s]*$')
+
+
+def _needs_agent(remaining):
+    """Whether a compound sentence's second clause is real work.
+
+    The fast path may only claim a sentence it can finish. A tail that still
+    names an action ("在输入框里输入X", "找到小军") belongs to the agent loop.
+    """
+    tail=str(remaining or '').strip().strip('。！？!?，, ')
+    return bool(tail) and not _TAIL_ONLY.match(tail)
+
+
+def _is_known_local_app(target):
+    """目标是否确实是一个已知的本地软件。
+
+    只读 runtime/chat/authorized_apps.json（几行 JSON），不扫开始菜单或注册表，
+    所以可以在路由阶段安全调用。
+    """
+    value=str(target or '').strip()
+    if not value:return False
+    if value in APP_ALIASES:return True
+    try:
+        from core.authorized_apps import SCRIPT_ALIASES
+        if value in SCRIPT_ALIASES:return True
+    except Exception:
+        pass
+    try:
+        from core.authorized_apps import AuthorizedApps
+        entries=AuthorizedApps().entries()
+    except Exception:
+        return False
+    folded=value.casefold()
+    return any(str(key).casefold()==folded for key in entries)
+
+
+# 像网站名：2-8 个中文/字母/数字字符，允许间隔号与连字符。
+SITE_LIKE=re.compile(r'^[\u4e00-\u9fffA-Za-z0-9·\-]{2,8}$')
+
+
+def _unresolved_site_candidate(target):
+    """看着像网站名、但不是任何已知本地软件的短词。
+
+    2026-11-12：fast path 只该拦它确定能完成的事。原来「打开京东」会被直接判成
+    open_app，applications 找不到就报「未找到名为京东的软件」收场——而智能体本来
+    能用 browser/web_search 打开 jd.com。用户说「打开京东官网」反而成功，正是因为
+    含"官网"被排除词挡下、交给了智能体。
+    这里把这类词交还给智能体，让 fast path 不再抢它做不到的活。
+    """
+    value=str(target or '').strip()
+    if not value or len(value)>8:return False
+    if not SITE_LIKE.match(value):return False
+    if value in SITE_ALIASES or value.casefold() in SITE_ALIASES:return False
+    if _is_known_local_app(value):return False
+    return True
 
 
 def match(text):
@@ -179,16 +249,20 @@ def match(text):
     if window_kind:
         return dict(prefix,matched=True,action='window_control',kind=window_kind['kind'],
                     target=('浏览器' if window_kind['browser'] else window_kind['kind']),silent=True,priority='fast')
-    # "打开微信，找到小军": do the local part immediately, keep the rest as a
-    # stated limitation instead of sending the whole sentence to a dead gateway.
+    # "打开微信，找到小军" is one task with two steps. The fast path may only
+    # claim what it can finish: a real second clause hands the whole sentence to
+    # the agent loop instead of opening the app and reporting the rest as undone.
     compound=re.match(r'^(?:帮我|请)?(?:把|将)?(?:打开|启动)(?:一下)?\s*([^，,。；;？?]{1,20})[，,]\s*(.+)$',value)
     if compound:
         target=compound.group(1).strip().strip('“”"\' ')
         if target in BROWSER_NAMES:target='浏览器'
         if (target and len(target)<=20 and target not in SITE_ALIASES
                 and not re.search(r'然后|接着|搜索|网页|网站|http|是什么|为什么|怎么',target)):
+            remaining=str(compound.group(2)).strip()[:200]
+            if _needs_agent(remaining):
+                return dict(prefix,matched=False,action='none',silent=False)
             return dict(prefix,matched=True,action='open_app',silent=True,priority='fast',kind='app',
-                        target=target,remaining=str(compound.group(2))[:200])
+                        target=target)
     inverted=re.fullmatch(r'(?:把|将)?\s*(.+?)\s*(?:给)?(?:打开|启动|开一下)(?:一下|吧)?',value)
     if inverted:
         target=re.sub(r'^(?:这个|那个|我的)','',inverted.group(1).strip()).strip('“”"\' ')
@@ -226,12 +300,23 @@ def match(text):
     match=re.fullmatch(r'(?:打开|启动)(?:一下)?\s*(.+)',value)
     if match:
         target=re.sub(r'(?:一下|好吗|可以吗|吗|吧)$','',match.group(1).strip()).strip()
+        # "打开我的b站"——口语里的"我的"不是软件名的一部分，先剥掉再按站点认
+        bare=re.sub(r'^(?:我的|我那个|那个|咱的)', '', target).strip()
+        if bare and bare.casefold() in SITE_ALIASES:
+            return dict(prefix,matched=True,action='open_url',silent=True,priority='fast',
+                        kind='url',target=SITE_ALIASES[bare.casefold()])
         if target in BROWSER_NAMES:
             return dict(prefix,matched=True,action='open_app',silent=True,priority='fast',kind='app',target='浏览器')
-        if target and len(target)<=80 and not re.search(
-                r'然后|接着|并且|再帮|并|不要|如果|输入|打字|填写|写入|写一|写个|撰写|保存|发送|搜索|查找|找到|编辑|点击|登录|录入|修复|安装|下载|网站|网页|网址|官网|是什么|什么意思|为什么|怎么|如何|会怎样|会怎么样|[，,。;；：:]|[?？]',target):
+        if target and len(target)<=20 and not re.search(
+                r'然后|接着|并且|再帮|并|不要|如果|输入|打字|填写|写入|写一|写个|撰写|保存|发送|搜索|查找|找到|编辑|点击|登录|录入|修复|安装|下载|网站|网页|网址|官网|是什么|什么意思|为什么|怎么|如何|会怎样|会怎么样'
+                r'|在|后|以后|之后|里面|里|中|新建|创建|建一个|对话|会话|消息|发给|说|问|告诉|帮我|请|一下'
+                r'|[，,。;；：:]|[?？]',target):
             # Resolve installed apps on the existing launch worker, never scan
             # the Start Menu on Qt/voice threads or require a duplicate grant.
+            if _unresolved_site_candidate(target):
+                # 不是已知本地软件、又长得像网站名：不要抢着当软件启动，
+                # 交给智能体（browser + web_search 能处理任意网站）。
+                return dict(matched=False,action='none',silent=False)
             return dict(prefix,matched=True,action='open_app',silent=True,priority='fast',kind='app',target=target)
     return dict(matched=False,action='none',silent=False)
 

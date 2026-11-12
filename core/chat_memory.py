@@ -12,6 +12,11 @@ _INFLIGHT=None
 _READER=None
 
 
+def invalidate():
+    """A confirmed explicit write invalidates recall without cancelling live reads."""
+    with _LOCK:_CACHE.clear()
+
+
 def close():
     global _READER
     reader,_READER=_READER,None

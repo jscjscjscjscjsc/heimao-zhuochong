@@ -42,14 +42,33 @@ class WorkflowCatalog:
 
     def define(self, trigger, instructions, title='', state='active'):
         trigger = safe_text(trigger).strip()[:120]
-        instructions = safe_text(instructions).strip()[:8000]
+        instructions = self._instructions(instructions)
         if not trigger or not instructions:
             raise ValueError('工作流需要触发词和步骤')
+        if state not in ('active','candidate','disabled'):raise ValueError('未知工作流状态')
         ident = 'custom-'+uuid.uuid4().hex[:12]
         with self.connect() as db:
             db.execute('INSERT INTO workflows VALUES (?,?,?,?,?,?,?,?,?)',
                 (ident, title.strip()[:120] or trigger, trigger, instructions,
                  state, 0, 0, '', time.time()))
+        return self.get(ident)
+
+    @staticmethod
+    def _instructions(value):
+        text=str(value or '').strip()
+        if len(text)>32000:raise ValueError('工作流最多 32000 字，请分成可检查的阶段')
+        if any(safe_text(text[i:i+8000])!=text[i:i+8000].strip() for i in range(0,len(text),8000)):
+            raise ValueError('工作流中不能包含密钥，请使用配置引用')
+        return text
+
+    def update(self,ident,trigger,instructions,title=''):
+        self.get(ident)
+        trigger=safe_text(trigger).strip()[:120]
+        instructions=self._instructions(instructions)
+        if not trigger or not instructions:raise ValueError('工作流需要触发词和步骤')
+        with self.connect() as db:
+            db.execute('UPDATE workflows SET title=?,trigger=?,instructions=?,updated=? WHERE id=?',
+                       (safe_text(title)[:120] or trigger,trigger,instructions,time.time(),ident))
         return self.get(ident)
 
     def get(self, ident):
